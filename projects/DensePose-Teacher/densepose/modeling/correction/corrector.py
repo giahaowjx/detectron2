@@ -11,8 +11,9 @@ from torch import nn
 from torch.nn import functional as F
 
 from detectron2.config import CfgNode
-from detectron2.layers import Conv2d, interpolate, ConvTranspose2d
+from detectron2.layers import Conv2d, interpolate, ConvTranspose2d, ASPP, get_norm
 from ..utils import initialize_module_params
+from detectron2.utils.file_io import PathManager
 
 from densepose import DensePoseDataRelative
 
@@ -178,7 +179,9 @@ class InterpolationHelper:
 
 
 class Corrector(nn.Module):
-    # DEFAULT_MODEL_CHECKPOINT_PREFIX = "roi_heads.corrector."
+
+    DEFAULT_MODEL_CHECKPOINT_PREFIX = "roi_heads.corrector."
+
     def __init__(self, cfg: CfgNode):
         """
         Initialize mesh correctors. An corrector for mesh `i` is stored in a submodule
@@ -193,8 +196,8 @@ class Corrector(nn.Module):
         self.n_stacked_convs = cfg.MODEL.SEMI.COR.NUM_STACKED_CONVS
         # fmt: on
         pad_size = kernel_size // 2
-        n_pred_channels = (cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_PATCHES + 1) * 3
-        n_channels = n_pred_channels + 256 # + cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_COARSE_SEGM_CHANNELS
+        n_pred_channels = (cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_PATCHES + 1) + 2
+        n_channels = n_pred_channels + 256 + 1 # + cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_COARSE_SEGM_CHANNELS
         # self.upsample = ConvTranspose2d(n_pool_channels, n_pred_channels, 4, stride=2, padding=1)
         for i in range(self.n_stacked_convs):
             layer = Conv2d(n_channels, hidden_dim, kernel_size, stride=1, padding=pad_size)
@@ -205,255 +208,67 @@ class Corrector(nn.Module):
         self.predictor = CorrectorPredictor(cfg, self.n_out_channels)
         initialize_module_params(self)
         self.non_local = NonLocalBlock(in_channels=n_channels)
+        # self.aspp = ASPP(in_channels=n_channels, out_channels=n_channels, dilations=[6, 12, 18],
+        #                     norm="BN", activation=F.relu)
 
         self.w_segm = cfg.MODEL.SEMI.COR.SEGM_WEIGHTS
 
         self.w_points = cfg.MODEL.SEMI.COR.POINTS_WEIGHTS
         self.patch_channels = cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_PATCHES + 1
-        self.correct_warm_iter = cfg.MODEL.SEMI.COR.WARM_ITER
-        if self.correct_warm_iter == 0:
-            self.correct_warm_iter = cfg.SOLVER.MAX_ITER
-
-        # self.coarse_part_index = np.array(
-        #     [0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8],
-        # )
-
         logger = logging.getLogger(__name__)
         logger.info(f"Adding Corrector ...")
-        # if cfg.MODEL.WEIGHTS != "":
-        #     self.load_from_model_checkpoint(cfg.MODEL.WEIGHTS)
+        if cfg.MODEL.WEIGHTS != "":
+            self.load_from_model_checkpoint(cfg.MODEL.WEIGHTS)
 
-    def forward(self, instances: List[Instances]):
-    # def forward(self, predictor_output, pool_feats):
-        pool_feats = torch.cat([x.pool_feat for x in instances], dim=0)
-        # pred_densepose_coarse_segm = torch.cat([x.pred_densepose.coarse_segm for x in instances], dim=0)
-        pred_densepose_segm = torch.cat([x.pred_densepose.fine_segm for x in instances], dim=0)
-        pred_densepose_u = torch.cat([x.pred_densepose.u for x in instances], dim=0)
-        pred_densepose_v = torch.cat([x.pred_densepose.v for x in instances], dim=0)
-        # pred_densepose_segm = predictor_output.fine_segm
-        # pred_densepose_u = predictor_output.u
-        # pred_densepose_v = predictor_output.v
-        # process input features and prediction
-        # pred_densepose_segm = F.softmax(pred_densepose_segm, dim=1)
-        # pred_densepose_u = (pred_densepose_u * 255.0).clamp(0, 255.0) / 255.0
-        # pred_densepose_v = (pred_densepose_v * 255.0).clamp(0, 255.0) / 255.0
+    def forward(self, features_dp, predictor_outputs):
+        with torch.no_grad():
+            fine_segm = F.interpolate(predictor_outputs.fine_segm, size=features_dp.shape[-2:], mode='bilinear', align_corners=False)
+            coarse_segm = F.interpolate(predictor_outputs.coarse_segm, size=features_dp.shape[-2:], mode='bilinear', align_corners=False)
+            p = F.softmax(fine_segm, dim=1)
+            coarse_segm = F.softmax(coarse_segm, dim=1)
 
-        # pred_densepose_coarse_segm = F.interpolate(pred_densepose_coarse_segm, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False)
-        # pred_densepose_segm = F.interpolate(pred_densepose_segm, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False)
-        # pred_densepose_u = F.interpolate(pred_densepose_u, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False)
-        # pred_densepose_v = F.interpolate(pred_densepose_v, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False)
+            fine_segm_entropy = torch.sum(-p * F.log_softmax(fine_segm, dim=1), dim=1).unsqueeze(1)
 
-        # pred_densepose_segm = down_sampling(pred_densepose_segm, pool_feats.size(-2), pool_feats.size(-1))
-        # pred_densepose_u = down_sampling(pred_densepose_u, pool_feats.size(-2), pool_feats.size(-1))
-        # pred_densepose_v = down_sampling(pred_densepose_v, pool_feats.size(-1), pool_feats.size(-1))
-        
-        # concat the pred and output
-        # pool_feats = self.upsample(pool_feats)
-        # pool_feats = interpolate(pool_feats, scale_factor=2, mode='bilinear', align_corners=False)
-        output = torch.cat((
-            pool_feats,
-            # F.interpolate(pred_densepose_coarse_segm, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False),
-            F.interpolate(pred_densepose_segm, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False),
-            F.interpolate(pred_densepose_u, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False),
-            F.interpolate(pred_densepose_v, size=pool_feats.shape[-2:], mode='bilinear', align_corners=False)
-        ), dim=1)
+            features_input = features_dp.detach()
+
+        output = torch.cat((features_input, coarse_segm, p, fine_segm_entropy), dim=1)
+
         for i in range(self.n_stacked_convs):
             layer_name = self._get_layer_name(i)
             output = getattr(self, layer_name)(output)
             output = F.relu(output)
             if (i + 1) == self.n_stacked_convs // 2:
+                # output = self.aspp(output)
                 output = self.non_local(output)
-        output = self.predictor(output)
-
-        # return output
-        if self.training:
-            # get packed gt value
-            accumulator = Accumulator()
-            for instance in instances:
-                accumulator.accumulate(instance)
-            packed_annotations = accumulator.pack()
-            if packed_annotations is None:
-                segm_loss = self.fake_segm_loss(output)
-                points_loss = self.fake_points_loss(output)
-            else:
-                h, w = output.u.shape[-2:]
-                interpolator = InterpolationHelper.from_matches(
-                    packed_annotations,
-                    (h, w),
-                )
-                segm_loss = self.segm_loss(
-                    output,
-                    packed_annotations,
-                    interpolator,
-                    pred_densepose_segm,
-                    torch.cat([x.pred_densepose.coarse_segm for x in instances], dim=0)
-                )
-
-                points_loss = self.points_loss(
-                    output,
-                    packed_annotations,
-                    interpolator,
-                    pred_densepose_u,
-                    pred_densepose_v,
-                )
-
-            return output, {**segm_loss, **points_loss}
-
-        return output, None
+        return self.predictor(output)
 
     def interp(self, tensor_nchw):
         return interpolate(
             tensor_nchw, scale_factor=2, mode="bilinear", align_corners=False
         )
 
-    def correct(self, corrections, teacher_outputs: List[Instances], cur_iter=None):
-    # def correct(self, corrections, teacher_outputs: DensePoseChartPredictorOutput, cur_iter=None):
-        with torch.no_grad():
-            crt_segm = F.softmax(corrections.fine_segm, dim=1)
-            pos_idx = (torch.argmax(crt_segm, dim=1) == self.patch_channels).unsqueeze(1)
-            k = 0
-            for output in teacher_outputs:
-                if cur_iter is None:
-                    correct_rate = 1 - (1 + self.correct_warm_iter) / (50000 + self.correct_warm_iter)
-                else:
-                    correct_rate = 1 - (1 + self.correct_warm_iter) / (cur_iter + 1 + self.correct_warm_iter)
-                # else:
-                #     correct_rate = 1 - (1 + self.correct_warm_iter) / (120000 + self.correct_warm_iter)
-                n_i = len(output)
-                # correct pseudo segm
-                cur_crt_segm = crt_segm[k:k + n_i, :-1]
-                cur_pos_idx = pos_idx[k:k + n_i].expand(-1, self.patch_channels, -1, -1)
-                # output.pred_densepose.fine_segm = self.interp(output.pred_densepose.fine_segm)
-                output.pred_densepose.fine_segm[~cur_pos_idx] = output.pred_densepose.fine_segm[~cur_pos_idx] * (1 - correct_rate) + \
-                                                                cur_crt_segm[~cur_pos_idx] * correct_rate
-                # output.pred_densepose.fine_segm[~cur_pos_idx] = cur_crt_segm[~cur_pos_idx]
-
-                # correct pseudo uv coordinates
-                u_correction = ((corrections.u[k:k + n_i] * 255.0).clamp(-255.0, 255.0) / 255.0 * 0.05) * correct_rate
-                v_correction = ((corrections.v[k:k + n_i] * 255.0).clamp(-255.0, 255.0) / 255.0 * 0.05) * correct_rate
-                # u_correction = (corrections.u[k: k + n_i].unsqueeze(1).clamp(0, 0.07)) * correct_rate
-                # v_correction = (corrections.v[k, k + n_i].unsqueeze(1).clamp(0, 0.07)) * correct_rate
-                output.pred_densepose.u = (u_correction + output.pred_densepose.u).clamp(0., 1.)
-                output.pred_densepose.v = (v_correction + output.pred_densepose.v).clamp(0., 1.)
-
-                k += n_i
-            # if cur_iter is None:
-            #     correct_rate = 1
-            # else:
-            #     correct_rate = 1 - (1 + self.correct_warm_iter) / (cur_iter + 1 + self.correct_warm_iter)
-            # u_corrections = corrections.u.clamp(-0.07, 0.07) * correct_rate
-            # v_corrections = corrections.v.clamp(-0.07, 0.07) * correct_rate
-            # teacher_outputs.u = (u_corrections + teacher_outputs.u).clamp(0., 1.)
-            # teacher_outputs.v = (v_corrections + teacher_outputs.v).clamp(0., 1.)
-            #
-            # pos_idx = pos_idx.expand(-1, self.patch_channels, -1, -1)
-            # teacher_outputs.fine_segm[~pos_idx] = teacher_outputs.fine_segm[~pos_idx] * (1 - correct_rate) + \
-            #                                     corrections.fine_segm[:, :-1, :, :][~pos_idx] * correct_rate
-
-    def segm_loss(self, correction, packed_annotations, interpolator, fine_segm, coarse_segm):
-        #segm loss - first construct gt for corrector
-        segm_pred = interpolator.extract_at_points(
-            fine_segm,
-            slice_fine_segm=slice(None),
-            w_ylo_xlo=interpolator.w_ylo_xlo[:, None],
-            w_ylo_xhi=interpolator.w_ylo_xhi[:, None],
-            w_yhi_xlo=interpolator.w_yhi_xlo[:, None],
-            w_yhi_xhi=interpolator.w_yhi_xhi[:, None],
-        ).argmax(dim=1).long()
-        segm_gt = packed_annotations.fine_segm_labels_gt
-        segm_crt_gt = torch.ones_like(segm_gt) * self.patch_channels
-        index = segm_pred != segm_gt
-        segm_crt_gt[index] = segm_gt[index]
-
-        # get correction pred
-        segm_crt_est = interpolator.extract_at_points(
-            correction.fine_segm,
-            slice_fine_segm=slice(None),
-            w_ylo_xlo=interpolator.w_ylo_xlo[:, None],
-            w_ylo_xhi=interpolator.w_ylo_xhi[:, None],
-            w_yhi_xlo=interpolator.w_yhi_xlo[:, None],
-            w_yhi_xhi=interpolator.w_yhi_xhi[:, None],
-        )
-
-        # coarse_segm_pred = torch.argmax(coarse_segm[packed_annotations.bbox_indices], dim=1)
-        # coarse_segm_gt = F.interpolate(packed_annotations.coarse_segm_gt.unsqueeze(1), size=coarse_segm_pred.shape[-2:],
-        #                                mode='nearest', align_corners=True) > 0
-        # coarse_segm_gt = down_sampling(packed_annotations.coarse_segm_gt.unsqueeze(1), coarse_segm_pred.shape[-2],
-        #                                coarse_segm_pred.shape[-1]).squeeze(1)
-
-        # coarse_segm_crt_gt = coarse_segm_gt == coarse_segm_pred
-
-        # loss = F.cross_entropy(segm_crt_est, segm_crt_gt.long(), reduction='none')
-        # loss[index] = loss[index] * 2
-        return {
-            "loss_correction_I": F.cross_entropy(segm_crt_est, segm_crt_gt.long()) * self.w_segm,
-            # "loss_correction_S": F.cross_entropy(correction.coarse_segm[packed_annotations.bbox_indices],
-            #                                      coarse_segm_crt_gt.long()) * self.w_segm * 5
-        }
-
-    def points_loss(self, correction, packed_annotations, interpolator, u, v):
-        # uv loss - first construct gt for corrector
-        u_pred = interpolator.extract_at_points(u)
-        v_pred = interpolator.extract_at_points(v)
-        u_crt_gt = packed_annotations.u_gt - u_pred
-        v_crt_gt = packed_annotations.v_gt - v_pred
-
-        u_crt_est = interpolator.extract_at_points(correction.u)
-        v_crt_est = interpolator.extract_at_points(correction.v)
-
-        return {
-            "loss_correction_U": F.smooth_l1_loss(u_crt_est, u_crt_gt, reduction='sum') * self.w_points,
-            "loss_correction_V": F.smooth_l1_loss(v_crt_est, v_crt_gt, reduction='sum') * self.w_points,
-        }
-
-    def fake_segm_loss(self, correction):
-        return {
-            "loss_correction_I": correction.fine_segm.sum() * 0,
-            "loss_correction_S": correction.coarse_segm.sum() * 0
-        }
-
-    def fake_points_loss(self, correction):
-        return {
-            "loss_correction_U": correction.u.sum() * 0,
-            "loss_correction_V": correction.v.sum() * 0,
-        }
-
     def _get_layer_name(self, i: int):
         layer_name = "corrector_conv_fcn{}".format(i + 1)
         return layer_name
 
+    def load_from_model_checkpoint(self, fpath: str, prefix: Optional[str] = None):
+        import numpy as np
 
-def down_sampling(z, wout, hout, mode: str='nearest', padding_mode:str='zeros'):
-    n = z.shape[0]
-    grid_w = torch.arange(wout, device=z.device, dtype=torch.float) / wout
-    grid_h = torch.arange(hout, device=z.device, dtype=torch.float) / hout
-    grid_w = grid_w[None, None, :].expand(n, hout, wout) * 2 - 1
-    grid_h = grid_h[None, :, None].expand(n, hout, wout) * 2 - 1
-    grid = torch.stack((grid_w, grid_h), dim=3)
-    return F.grid_sample(z, grid, mode=mode, padding_mode=padding_mode, align_corners=True)
-
-    # def load_from_model_checkpoint(self, fpath: str, prefix: Optional[str] = None):
-    #     if prefix is None:
-    #         prefix = Corrector.DEFAULT_MODEL_CHECKPOINT_PREFIX
-    #     state_dict = None
-    #     if fpath.endswith(".pkl"):
-    #         with PathManager.open(fpath, "rb") as hFile:
-    #             state_dict = pickle.load(hFile, encoding="latin1")  # pyre-ignore[6]
-    #     else:
-    #         with PathManager.open(fpath, "rb") as hFile:
-    #             state_dict = torch.load(hFile, map_location=torch.device("cpu"))
-    #     if state_dict is not None and "model" in state_dict:
-    #         state_dict_local = {}
-    #         for key in state_dict["model"]:
-    #             if key.startswith(prefix):
-    #                 v_key = state_dict["model"][key]
-    #                 if isinstance(v_key, np.ndarray):
-    #                     v_key = torch.from_numpy(v_key)
-    #                 state_dict_local[key[len(prefix) :]] = v_key
-    #         # non-strict loading to finetune on different meshes
-    #         # pyre-fixme[6]: Expected `OrderedDict[typing.Any, typing.Any]` for 1st
-    #         #  param but got `Dict[typing.Any, typing.Any]`.
-    #         self.load_state_dict(state_dict_local, strict=False)
+        if prefix is None:
+            prefix = Corrector.DEFAULT_MODEL_CHECKPOINT_PREFIX
+        if fpath.endswith(".pkl"):
+            return
+        with PathManager.open(fpath, "rb") as hFile:
+                state_dict = torch.load(hFile, map_location=torch.device("cpu"))
+        if state_dict is not None and "model" in state_dict:
+            state_dict_local = {}
+            for key in state_dict["model"]:
+                if key.startswith(prefix):
+                    v_key = state_dict["model"][key]
+                    if isinstance(v_key, np.ndarray):
+                        v_key = torch.from_numpy(v_key)
+                    state_dict_local[key[len(prefix) :]] = v_key
+            self.load_state_dict(state_dict_local, strict=False)
 
 
 class CorrectorPredictor(nn.Module):
@@ -464,32 +279,18 @@ class CorrectorPredictor(nn.Module):
         # kernel_size = cfg.MODEL.SEMI.COR.CONV_HEAD_KERNEL
         kernel_size = cfg.MODEL.ROI_DENSEPOSE_HEAD.DECONV_KERNEL
 
-        # self.segm_correction = Conv2d(
-        #     dim_in, dim_out_patches + 1, kernel_size, stride=1, padding=kernel_size//2
-        # )
-        #
-        # self.u_correction = Conv2d(
-        #     dim_in, dim_out_patches, kernel_size, stride=1, padding=kernel_size//2
-        # )
-        #
-        # self.v_correction = Conv2d(
-        #     dim_in, dim_out_patches, kernel_size, stride=1, padding=kernel_size//2
-        # )
-        # self.ann_index_correction = ConvTranspose2d(
-        #     dim_in, 2, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
-        # )
+        self.ann_index_correction = ConvTranspose2d(
+            dim_in, 1, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+        )
 
         self.segm_correction = ConvTranspose2d(
-            dim_in, dim_out_patches + 1, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+            dim_in, 1, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
         )
 
-        self.u_correction = ConvTranspose2d(
+        self.sigma_correction = ConvTranspose2d(
             dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
         )
 
-        self.v_correction = ConvTranspose2d(
-            dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
-        )
         self.scale_factor = cfg.MODEL.ROI_DENSEPOSE_HEAD.UP_SCALE
         initialize_module_params(self)
 
@@ -500,19 +301,17 @@ class CorrectorPredictor(nn.Module):
 
     def forward(self, corrector_output: torch.Tensor):
         return CorrectorPredictorOutput(
-            # coarse_segm=self.interp2d(self.ann_index_correction(corrector_output)),
+            coarse_segm=self.interp2d(self.ann_index_correction(corrector_output)),
             fine_segm=self.interp2d(self.segm_correction(corrector_output)),
-            u=self.interp2d(self.u_correction(corrector_output)),
-            v=self.interp2d(self.v_correction(corrector_output)),
-        )  
+            sigma=self.interp2d(self.sigma_correction(corrector_output))
+        )
 
 
 @dataclass
 class CorrectorPredictorOutput:
-    # coarse_segm: torch.Tensor
+    coarse_segm: torch.Tensor
     fine_segm: torch.Tensor
-    u: torch.Tensor
-    v: torch.Tensor
+    sigma: torch.Tensor
 
     def __len__(self):
         return self.coarse_segm.size(0)
@@ -522,29 +321,25 @@ class CorrectorPredictorOutput:
     ):
         if isinstance(item, int):
             return CorrectorPredictorOutput(
-                # coarse_segm=self.coarse_segm.unsqueeze(0),
+                coarse_segm=self.coarse_segm[item].unsqueeze(0),
                 fine_segm=self.fine_segm[item].unsqueeze(0),
-                u=self.u[item].unsqueeze(0),
-                v=self.v[item].unsqueeze(0),
+                sigma=self.sigma[item].unsqueeze(0)
             )
         else:
             return CorrectorPredictorOutput(
-                # coarse_segm=self.coarse_segm[item],
+                coarse_segm=self.coarse_segm[item],
                 fine_segm=self.fine_segm[item],
-                u=self.u[item],
-                v=self.v[item],
+                sigma=self.sigma[item],
             )
 
     def to(self, device: torch.device):
         """
         Transfers all tensors to the given device
         """
-        # coarse_segm = self.coarse_segm.to(device)
+        coarse_segm = self.coarse_segm.to(device)
         fine_segm = self.fine_segm.to(device)
-        u = self.u.to(device)
-        v = self.v.to(device)
-        return CorrectorPredictorOutput(fine_segm=fine_segm, u=u, v=v)
-
+        sigma = self.sigma.to(device)
+        return CorrectorPredictorOutput(coarse_segm=coarse_segm, fine_segm=fine_segm, sigma=sigma)
 
 class NonLocalBlock(nn.Module):
     def __init__(self, in_channels, inter_channels=None, mode='embedded', bn_layer=True) -> None:
@@ -588,6 +383,9 @@ class NonLocalBlock(nn.Module):
 
     def forward(self, x):
         batch_size = x.shape[0]
+
+        if batch_size == 0:
+            return x
 
         g_x = self.g(x).view(batch_size, self.inter_channels, -1)
         g_x = g_x.permute(0, 2, 1)

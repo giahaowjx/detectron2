@@ -2,9 +2,10 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from detectron2.config import CfgNode
-from detectron2.layers import ConvTranspose2d, interpolate
+from detectron2.layers import ConvTranspose2d, interpolate, Conv2d
 
 from ...structures import DensePoseChartPredictorOutput
 from ..utils import initialize_module_params
@@ -60,8 +61,33 @@ class DensePoseChartPredictor(nn.Module):
         self.v_lowres = ConvTranspose2d(
             dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
         )
+
+        # corrector
+        hidden_dim = cfg.MODEL.SEMI.COR.CONV_HEAD_DIM
+        conv_kernel_size = cfg.MODEL.SEMI.COR.CONV_HEAD_KERNEL
+        pad_size = conv_kernel_size // 2
+        n_channels = dim_in
+        self.n_stacked_convs = cfg.MODEL.SEMI.COR.NUM_STACKED_CONVS
+        for i in range(self.n_stacked_convs):
+            layer = Conv2d(n_channels, hidden_dim, conv_kernel_size, stride=1, padding=pad_size)
+            layer_name = _get_layer_name(i)
+            self.add_module(layer_name, layer)
+            n_channels = hidden_dim
+
+        self.crt_segm = ConvTranspose2d(
+            dim_in, dim_out_patches + 1, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+        )
+        self.channels_squeeze = Conv2d(dim_in, dim_in // 2, kernel_size=1, stride=1)
+
+        self.uv_confidence = cfg.MODEL.ROI_DENSEPOSE_HEAD.UV_CONFIDENCE.ENABLED
+        if self.uv_confidence:
+            self.crt_sigma = ConvTranspose2d(
+                dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+            )
+
         self.scale_factor = cfg.MODEL.ROI_DENSEPOSE_HEAD.UP_SCALE
         initialize_module_params(self)
+        # self.non_local = NonLocalBlock(in_channels=n_channels)
 
     def interp2d(self, tensor_nchw: torch.Tensor):
         """
@@ -77,26 +103,126 @@ class DensePoseChartPredictor(nn.Module):
             tensor_nchw, scale_factor=self.scale_factor, mode="bilinear", align_corners=False
         )
 
-    def forward(self, head_outputs: torch.Tensor):
-        """
-        Perform forward step on DensePose head outputs
+    def forward(self, head_outputs: torch.Tensor, features_dp: torch.Tensor = None):
+        fine_segm = self.interp2d(self.index_uv_lowres(head_outputs))
+        if features_dp is not None:
+            crt_output = torch.cat((self.channels_squeeze(head_outputs.detach()), features_dp.detach()), dim=1)
+            # crt_output = self.non_local(crt_output)
+            for i in range(self.n_stacked_convs):
+                layer_name = _get_layer_name(i)
+                crt_output = getattr(self, layer_name)(crt_output)
+                crt_output = F.relu(crt_output)
+            # crt_output = head_outputs
 
-        Args:
-            head_outputs (tensor): DensePose head outputs, tensor of shape [N, D, H, W]
-        Return:
-           An instance of DensePoseChartPredictorOutput
-        """
-        return DensePoseChartPredictorOutput(
+            crt_segm = self.interp2d(self.crt_segm(crt_output))
+            crt_sigma = self.interp2d(self.crt_sigma(crt_output))
+        else:
+            crt_segm = None
+            crt_sigma = None
+
+        output = DensePoseChartPredictorOutput(
             coarse_segm=self.interp2d(self.ann_index_lowres(head_outputs)),
-            fine_segm=self.interp2d(self.index_uv_lowres(head_outputs)),
+            fine_segm=fine_segm,
             u=self.interp2d(self.u_lowres(head_outputs)),
             v=self.interp2d(self.v_lowres(head_outputs)),
+            crt_segm=crt_segm,
+            crt_sigma=crt_sigma,
         )
 
-    def forward_without_upsample(self, head_outputs: torch.Tensor):
-        return DensePoseChartPredictorOutput(
-            coarse_segm=self.ann_index_lowres(head_outputs),
-            fine_segm=self.index_uv_lowres(head_outputs),
-            u=self.u_lowres(head_outputs),
-            v=self.v_lowres(head_outputs),
-        )
+        return output
+
+
+def _get_layer_name(i: int):
+    layer_name = "body_conv_fcn{}".format(i + 1)
+    return layer_name
+
+
+class NonLocalBlock(nn.Module):
+    def __init__(self, in_channels, inter_channels=None, mode='embedded', bn_layer=True) -> None:
+        super().__init__()
+        if mode not in ['gaussian', 'embedded', 'dot', 'concatenate']:
+            raise ValueError('`mode` must be one of `gaussian`, `embedded`, `dot` or `concatenate`')
+
+        self.mode = mode
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+
+        if self.inter_channels is None:
+            self.inter_channels = in_channels // 2
+            if self.inter_channels == 0:
+                self.inter_channels = 1
+
+        self.g = nn.Conv2d(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+
+        if bn_layer:
+            self.W_z = nn.Sequential(
+                nn.Conv2d(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1),
+                nn.BatchNorm2d(self.in_channels)
+            )
+            nn.init.constant_(self.W_z[1].weight, 0)
+            nn.init.constant_(self.W_z[1].bias, 0)
+        else:
+            self.W_z = nn.Conv2d(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1)
+
+            nn.init.constant_(self.W_z.weight, 0)
+            nn.init.constant_(self.W_z.bias, 0)
+
+        if self.mode == 'embedded' or self.mode == 'dot' or self.mode == 'concatenate':
+            self.theta = nn.Conv2d(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+            self.phi = nn.Conv2d(in_channels=self.in_channels, out_channels=self.inter_channels, kernel_size=1)
+
+        if self.mode == 'concatenate':
+            self.W_f = nn.Sequential(
+                nn.Conv2d(in_channels=self.inter_channels * 2, out_channels=1, kernel_size=1),
+                nn.ReLU()
+            )
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+
+        if batch_size == 0:
+            return x
+
+        g_x = self.g(x).view(batch_size, self.inter_channels, -1)
+        g_x = g_x.permute(0, 2, 1)
+
+        if self.mode == 'gaussian':
+            theta_x = x.view(batch_size, self.in_channels, -1)
+            phi_x = x.view(batch_size, self.in_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == 'embedded' or self.mode == 'dot':
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, -1)
+            theta_x = theta_x.permute(0, 2, 1)
+            f = torch.matmul(theta_x, phi_x)
+
+        elif self.mode == 'concatenate':
+            theta_x = self.theta(x).view(batch_size, self.inter_channels, -1, 1)
+            phi_x = self.phi(x).view(batch_size, self.inter_channels, 1, -1)
+
+            h = theta_x.size(2)
+            w = phi_x.size(3)
+            theta_x = theta_x.repeat(1, 1, 1, w)
+            phi_x = phi_x.repeat(1, 1, h, 1)
+
+            concat = torch.cat([theta_x, phi_x], dim=1)
+            f = self.W_f(concat)
+            f = f.view(f.sze(0), f.size(2), f.size(3))
+
+        if self.mode == 'gaussian' or self.mode == 'embedded':
+            f_div_C = F.softmax(f, dim=1)
+        elif self.mode == 'dot' or self.mode == 'concatenate':
+            N = f.size(-1)
+            f_div_C = f / N
+
+        y = torch.matmul(f_div_C, g_x)
+
+        y = y.permute(0, 2, 1).contiguous()
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+
+        W_y = self.W_z(y)
+        z = W_y + x
+
+        return z

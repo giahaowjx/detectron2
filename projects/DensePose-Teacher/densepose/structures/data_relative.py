@@ -8,6 +8,8 @@ from densepose.data.meshes.catalog import MeshCatalog
 from densepose.structures.mesh import load_mesh_symmetry
 from densepose.structures.transform_data import DensePoseTransformData
 
+POINT_LABEL_SYMMETRIES = [0, 1, 2, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17, 20, 19, 22, 21, 24, 23]
+
 
 class DensePoseDataRelative(object):
     """
@@ -49,16 +51,19 @@ class DensePoseDataRelative(object):
     MASK_SIZE = 256
 
     # Key for pseudo coarse segm labels
-    PSEUDO_SEGM = "dp_p_segm"
+    PSEUDO_COARSE_SEGM = "pseudo_coarse_segm"
+    PSEUDO_FINE_SEGM = "pseudo_fine_segm"
     # Key for pseudo u coordinates
-    PSEUDO_U = "dp_p_u"
+    PSEUDO_U = "pseudo_u"
     # Key for pseudo v coordinates
-    PSEUDO_V = "dp_p_v"
+    PSEUDO_V = "pseudo_v"
     # Size of pseudo labels
     PSEUDO_MASK_SIZE = 112
 
     # Key for pseudo embeddings
-    PSEUDO_EMBED = "dp_p_embed"
+    PSEUDO_MASK = "pseudo_mask"
+    # Key for pseudo sigma
+    PSEUDO_SIGMA = "pseudo_sigma"
 
     def __init__(self, annotation, cleanup=False):
         self.x = torch.as_tensor(annotation[DensePoseDataRelative.X_KEY])
@@ -96,14 +101,18 @@ class DensePoseDataRelative(object):
                 setattr(new_data, attr, getattr(self, attr).to(device))
         if hasattr(self, "mesh_id"):
             new_data.mesh_id = self.mesh_id
-        if hasattr(self, "dp_p_segm"):
-            new_data.dp_p_segm = self.dp_p_segm
-        if hasattr(self, "dp_p_u"):
-            new_data.dp_p_u = self.dp_p_u
-        if hasattr(self, "dp_p_v"):
-            new_data.dp_p_v = self.dp_p_v
-        if hasattr(self, "dp_p_embed"):
-            new_data.dp_p_embed = self.dp_p_embed
+        if hasattr(self, "pseudo_coarse_segm"):
+            new_data.pseudo_coarse_segm = self.pseudo_coarse_segm
+        if hasattr(self, "pseudo_fine_segm"):
+            new_data.pseudo_fine_segm = self.pseudo_fine_segm
+        if hasattr(self, "pseudo_u"):
+            new_data.pseudo_u = self.pseudo_u
+        if hasattr(self, "pseudo_v"):
+            new_data.pseudo_v = self.pseudo_v
+        if hasattr(self, "pseudo_mask"):
+            new_data.pseudo_mask = self.pseudo_mask
+        if hasattr(self, "pseudo_sigma"):
+            new_data.pseudo_sigma = self.pseudo_sigma
         new_data.device = device
         return new_data
 
@@ -189,10 +198,12 @@ class DensePoseDataRelative(object):
             DensePoseDataRelative.S_KEY,
             DensePoseDataRelative.VERTEX_IDS_KEY,
             DensePoseDataRelative.MESH_NAME_KEY,
-            DensePoseDataRelative.PSEUDO_SEGM,
+            DensePoseDataRelative.PSEUDO_COARSE_SEGM,
+            DensePoseDataRelative.PSEUDO_FINE_SEGM,
             DensePoseDataRelative.PSEUDO_U,
             DensePoseDataRelative.PSEUDO_V,
-            DensePoseDataRelative.PSEUDO_EMBED,
+            DensePoseDataRelative.PSEUDO_MASK,
+            DensePoseDataRelative.PSEUDO_SIGMA
         ]:
             if key in annotation:
                 del annotation[key]

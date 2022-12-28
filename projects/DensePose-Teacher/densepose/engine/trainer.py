@@ -19,6 +19,7 @@ from detectron2.evaluation import (
     DatasetEvaluators,
     print_csv_format,
     verify_results,
+    inference_on_dataset,
 )
 from detectron2.solver.build import get_default_optimizer_params, maybe_add_gradient_clipping
 from detectron2.solver import build_lr_scheduler
@@ -39,13 +40,9 @@ from densepose.data import (
     has_inference_based_loaders,
 )
 from densepose.evaluation.d2_evaluator_adapter import Detectron2COCOEvaluatorAdapter
-from densepose.evaluation.evaluator import DensePoseCOCOEvaluator, DensePoseCOCOSingleEvaluator, build_densepose_evaluator_storage, inference_on_dataset, inference_single_on_dataset
+from densepose.evaluation.evaluator import DensePoseCOCOEvaluator, DensePoseCOCOSingleEvaluator, build_densepose_evaluator_storage, inference_single_on_dataset
 from densepose.modeling.cse import Embedder
 from .train_loop import SimpleTrainer
-from .mean_teacher import MeanTeacher
-from densepose.data.transform import RandErase, RandomResize
-from densepose.modeling.correction import Corrector
-
 
 class SampleCountingLoader:
     def __init__(self, loader):
@@ -94,27 +91,18 @@ class Trainer(TrainerBase):
 
         # Assume these objects must be constructed in this order.
         student_model = self.build_model(cfg)
-        teacher_model = self.build_model(cfg)
+
         optimizer = self.build_optimizer(cfg, student_model)
         data_loader = self.build_train_loader(cfg)
 
-        if cfg.MODEL.SEMI.COR.CRT_ON:
-            corrector = Corrector(cfg)
-            corrector.to(torch.device(cfg.MODEL.DEVICE))
-        else:
-            corrector = None
-
         student_model = create_ddp_model(student_model, broadcast_buffers=False)
-        # teacher_model = create_ddp_model(teacher_model, broadcast_buffers=False)
-        # corrector = create_ddp_model(corrector, broadcast_buffers=False)
 
         # get data augmentation for student model input
-        strong_aug = []
-        if cfg.MODEL.SEMI.ERASE_ON:
-            strong_aug.append(RandErase(size=cfg.MODEL.SEMI.ERASE_SIZE, n_iterations=cfg.MODEL.SEMI.ERASE_ITER))
-            # strong_aug.append(RandomResize(short_edge_length=cfg.INPUT.MIN_SIZE_TRAIN, max_size=cfg.INPUT.MAX_SIZE_TRAIN))
+        # strong_aug = []
+        # if cfg.MODEL.SEMI.ERASE_ON:
+        #     strong_aug.append(RandErase(size=cfg.MODEL.SEMI.ERASE_SIZE, n_iterations=cfg.MODEL.SEMI.ERASE_ITER))
 
-        self._trainer = SimpleTrainer({"teacher": teacher_model, "student": student_model}, data_loader, optimizer, strong_aug, corrector)
+        self._trainer = SimpleTrainer(student_model, data_loader, optimizer)
 
         self.scheduler = self.build_lr_scheduler(cfg, optimizer)
         self.student_checkpointer = DetectionCheckpointer(
@@ -123,22 +111,6 @@ class Trainer(TrainerBase):
             cfg.OUTPUT_DIR,
             trainer=weakref.proxy(self),
         )
-        self.teacher_checkpointer = DetectionCheckpointer(
-            teacher_model,
-            cfg.MODEL.SEMI.TEACHER_OUTPUT
-        )
-        self.correct_on = cfg.MODEL.SEMI.COR.CRT_ON
-        if self.correct_on:
-            self.corrector_checkpointer = DetectionCheckpointer(
-                corrector,
-                cfg.MODEL.SEMI.COR.OUTPUT_DIR,
-            )
-
-        if comm.is_main_process():
-            if not os.path.exists(cfg.MODEL.SEMI.TEACHER_OUTPUT):
-                os.mkdir(cfg.MODEL.SEMI.TEACHER_OUTPUT)
-            if not os.path.exists(cfg.MODEL.SEMI.COR.OUTPUT_DIR):
-                os.mkdir(cfg.MODEL.SEMI.COR.OUTPUT_DIR)
 
         self.start_iter = 0
         self.max_iter = cfg.SOLVER.MAX_ITER
@@ -160,14 +132,7 @@ class Trainer(TrainerBase):
         Args:
             resume (bool): whether to do resume or not
         """
-        teacher_weights = self.cfg.MODEL.SEMI.TEACHER_WEIGHTS
-        if teacher_weights is None or teacher_weights == "":
-            teacher_weights = self.cfg.MODEL.WEIGHTS
-        self.teacher_checkpointer.resume_or_load(teacher_weights, resume=resume)
         self.student_checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
-        corrector_weights = self.cfg.MODEL.SEMI.COR.MODEL_WEIGHTS
-        if corrector_weights is not None:
-            self.corrector_checkpointer.resume_or_load(corrector_weights, resume=resume)
         if resume and self.student_checkpointer.has_checkpoint():
             # The checkpoint stores the training iteration that just finished, thus we start
             # at the next iteration
@@ -198,7 +163,6 @@ class Trainer(TrainerBase):
             )
             if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.student_model)
             else None,
-            MeanTeacher(warm_up=0),
         ]
 
         # Do PreciseBN before checkpointer, because it updates the model and need to
@@ -206,17 +170,10 @@ class Trainer(TrainerBase):
         # This is not always the best: if checkpointing has a different frequency,
         # some checkpoints may have more precise statistics than others.
         if comm.is_main_process():
-            ret.append(hooks.PeriodicCheckpointer(self.teacher_checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD))
             ret.append(hooks.PeriodicCheckpointer(self.student_checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD))
-            if self.correct_on:
-                ret.append(hooks.PeriodicCheckpointer(self.corrector_checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD))
-            ret.append(MeanTeacher(warm_up=0))
 
         def test_and_save_results():
-            if cfg.MODEL.SEMI.INFERENCE_ON == "student":
-                self._last_eval_results = self.test(self.cfg, self.student_model)
-            elif cfg.MODEL.SEMI.INFERENCE_ON == "teacher":
-                self._last_eval_results = self.test(self.cfg, self.teacher_model)
+            self._last_eval_results = self.test(self.cfg, self.student_model)
             return self._last_eval_results
 
         # Do evaluation after checkpointer, because then if it fails,
@@ -367,7 +324,6 @@ class Trainer(TrainerBase):
         cfg: CfgNode,
         model: nn.Module,
         evaluators: Optional[Union[DatasetEvaluator, List[DatasetEvaluator]]] = None,
-        corrector = None,
     ):
         """
         Args:
@@ -407,7 +363,7 @@ class Trainer(TrainerBase):
                     results[dataset_name] = {}
                     continue
             if cfg.DENSEPOSE_EVALUATION.DISTRIBUTED_INFERENCE or comm.is_main_process():
-                results_i = inference_on_dataset(model, data_loader, evaluator, corrector)
+                results_i = inference_on_dataset(model, data_loader, evaluator)
             else:
                 results_i = {}
             results[dataset_name] = results_i

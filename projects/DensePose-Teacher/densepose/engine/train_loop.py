@@ -3,13 +3,13 @@
 
 import numpy as np
 import time
-from typing import List, Mapping, Optional
+from typing import Mapping
 import torch
-
+import torch.nn.functional as F
+from torchvision.transforms.functional import rotate
 import detectron2.utils.comm as comm
 from detectron2.utils.events import EventStorage, get_event_storage
 from detectron2.engine import TrainerBase
-import copy
 
 
 class SimpleTrainer(TrainerBase):
@@ -31,7 +31,7 @@ class SimpleTrainer(TrainerBase):
     or write your own training loop.
     """
 
-    def __init__(self, models, data_loader, optimizer, strong_aug=None, corrector=None):
+    def __init__(self, student_model, data_loader, optimizer):
         """
         Args:
             model: a Dict of torch Module. Takes a data from data_loader and returns a
@@ -47,24 +47,10 @@ class SimpleTrainer(TrainerBase):
         If you want your model (or a submodule of it) to behave
         like evaluation during training, you can overwrite its train() method.
         """
-        student_model = models["student"]
-        teacher_model = models["teacher"]
-        student_model.train()
-        teacher_model.eval()
-        for param in teacher_model.parameters():
-            param.requires_grad = False
-
         self.student_model = student_model
-        self.teacher_model = teacher_model
-        self.teacher_model.roi_heads.it_is_teacher()
         self.data_loader = data_loader
         self._data_loader_iter = iter(data_loader)
         self.optimizer = optimizer
-        self.strong_aug = strong_aug
-        self.corrector = corrector
-        # self.corrector.eval()
-        # for param in corrector.parameters():
-        #     param.requires_grad = False
 
     def run_step(self):
         """
@@ -81,58 +67,9 @@ class SimpleTrainer(TrainerBase):
         """
         Firstly, Use teacher model to get pseudo labels
         """
-        teacher_input = [x["instances"] for x in data]
-        for x in teacher_input:
-            x.pred_boxes = x.gt_boxes
-            x.pred_classes = x.gt_classes
-
-        teacher_output = self.teacher_model.inference(copy.deepcopy(data), teacher_input, do_postprocess=False)
-        # for t in teacher_output:
-        #     t.pred_densepose.u = (t.pred_densepose.u * 255.0).clamp(0, 255.0) / 255.0
-        #     t.pred_densepose.v = (t.pred_densepose.v * 255.0).clamp(0, 255.0) / 255.0
-
-        del teacher_input
-
-        crt_loss = None
-        if self.corrector is not None:
-            correction, crt_loss = self.corrector(teacher_output)
-            self.corrector.correct(correction, teacher_output, self.iter)
-
-        # Construct input data for student model
-        for i, x in enumerate(data):
-            pseudo_label = teacher_output[i].pred_densepose
-            # pseudo_segm = torch.argmax(pseudo_label.fine_segm, dim=1).long()
-            pseudo_segm = pseudo_label.fine_segm
-            # == baseline ==
-            pseudo_u = pseudo_label.u
-            pseudo_v = pseudo_label.v
-
-            # == block ==
-            # pseudo_u = pseudo_label.u_cls
-            # pseudo_v = pseudo_label.v_cls
-
-            # == cse ==
-            # pseudo_embed = pseudo_label.embedding
-
-            for j, densepose_data in enumerate(x["instances"].gt_densepose):
-                if densepose_data is not None:
-                    # == densepose rcnn ==
-                    densepose_data.set("dp_p_segm", pseudo_segm[j])
-                    densepose_data.set("dp_p_u", pseudo_u[j])
-                    densepose_data.set("dp_p_v", pseudo_v[j])
-
-                    # == cse ==
-                    # densepose_data.set("dp_p_embed", pseudo_embed[j])
-
-        del teacher_output
-
-        if self.strong_aug is not None:
-            for aug in self.strong_aug:
-                data = aug(data)
+        self.student_model.module.update_iteration(self.iter)
 
         loss_dict = self.student_model(data)
-        if crt_loss is not None:
-            loss_dict.update(crt_loss)
         if isinstance(loss_dict, torch.Tensor):
             losses = loss_dict
             loss_dict = {"total_loss": loss_dict}

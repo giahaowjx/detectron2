@@ -155,6 +155,43 @@ class BilinearInterpolationHelper:
             w_yhi_xhi,
         )
 
+    @staticmethod
+    def from_matches_to_pseudo(
+            packed_annotations: Any, densepose_outputs_size_hw: Tuple[int, int]
+    ) -> "BilinearInterpolationHelper":
+        zh, zw = densepose_outputs_size_hw
+        x = packed_annotations.x_gt * zw / 256.0
+        y = packed_annotations.y_gt * zh / 256.0
+        x_valid = (x >= 0) * (x <= zw)
+        y_valid = (y >= 0) * (y <= zh)
+
+        x_lo = x.floor().long().clamp(min=0, max=zw - 1)
+        y_lo = y.floor().long().clamp(min=0, max=zh - 1)
+        x_hi = (x_lo + 1).clamp(max=zw - 1)
+        y_hi = (y_lo + 1).clamp(max=zh - 1)
+        x = torch.min(x_hi.float(), x)
+        y = torch.min(y_hi.float(), y)
+        x_w = x - x_lo.float()
+        y_w = y - y_lo.float()
+
+        w_ylo_xlo = (1.0 - x_w) * (1.0 - y_w)
+        w_ylo_xhi = x_w * (1.0 - y_w)
+        w_yhi_xlo = (1.0 - x_w) * y_w
+        w_yhi_xhi = x_w * y_w
+
+        return BilinearInterpolationHelper(
+            packed_annotations,
+            x_valid * y_valid,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo,  # pyre-ignore[6]
+            w_ylo_xhi,
+            w_yhi_xlo,
+            w_yhi_xhi,
+        )
+
     def extract_at_points(
         self,
         z_est,
@@ -163,8 +200,6 @@ class BilinearInterpolationHelper:
         w_ylo_xhi=None,
         w_yhi_xlo=None,
         w_yhi_xhi=None,
-        block=False,
-        block_slice=None
     ):
         """
         Extract ground truth values z_gt for valid point indices and estimated
@@ -185,20 +220,52 @@ class BilinearInterpolationHelper:
         w_yhi_xhi = self.w_yhi_xhi if w_yhi_xhi is None else w_yhi_xhi
 
         index_bbox = self.packed_annotations.point_bbox_indices
-        if block:
-            z_est_sampled = (
-                    z_est[index_bbox, slice_fine_segm, block_slice, self.y_lo, self.x_lo] * w_ylo_xlo
-                    + z_est[index_bbox, slice_fine_segm, block_slice, self.y_lo, self.x_hi] * w_ylo_xhi
-                    + z_est[index_bbox, slice_fine_segm, block_slice, self.y_hi, self.x_lo] * w_yhi_xlo
-                    + z_est[index_bbox, slice_fine_segm, block_slice, self.y_hi, self.x_hi] * w_yhi_xhi
-            )
-        else:
-            z_est_sampled = (
-                    z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_lo] * w_ylo_xlo
-                    + z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_hi] * w_ylo_xhi
-                    + z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_lo] * w_yhi_xlo
-                    + z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_hi] * w_yhi_xhi
-            )
+        z_est_sampled = (
+                z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_lo] * w_ylo_xlo
+                + z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_hi] * w_ylo_xhi
+                + z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_lo] * w_yhi_xlo
+                + z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_hi] * w_yhi_xhi
+        )
+        # x1 = z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_lo] * w_ylo_xlo
+        # x2 = z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_hi] * w_ylo_xhi
+        # x3 = z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_lo] * w_yhi_xlo
+        # x4 = z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_hi] * w_yhi_xhi
+        # z_est_sampled = x1 + x2 + x3 + x4
+        return z_est_sampled
+
+    def extract_at_points_pseduo(
+        self,
+        z_est,
+        slice_fine_segm=None,
+        w_ylo_xlo=None,
+        w_ylo_xhi=None,
+        w_yhi_xlo=None,
+        w_yhi_xhi=None,
+    ):
+        """
+        Extract ground truth values z_gt for valid point indices and estimated
+        values z_est using bilinear interpolation over top-left (y_lo, x_lo),
+        top-right (y_lo, x_hi), bottom-left (y_hi, x_lo) and bottom-right
+        (y_hi, x_hi) values in z_est with corresponding weights:
+        w_ylo_xlo, w_ylo_xhi, w_yhi_xlo and w_yhi_xhi.
+        Use slice_fine_segm to slice dim=1 in z_est
+        """
+        slice_fine_segm = (
+            self.packed_annotations.fine_segm_labels_gt
+            if slice_fine_segm is None
+            else slice_fine_segm
+        )
+        w_ylo_xlo = self.w_ylo_xlo if w_ylo_xlo is None else w_ylo_xlo
+        w_ylo_xhi = self.w_ylo_xhi if w_ylo_xhi is None else w_ylo_xhi
+        w_yhi_xlo = self.w_yhi_xlo if w_yhi_xlo is None else w_yhi_xlo
+        w_yhi_xhi = self.w_yhi_xhi if w_yhi_xhi is None else w_yhi_xhi
+
+        index_bbox = self.packed_annotations.point_bbox_with_dp_indices
+        x1 = z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_lo] * w_ylo_xlo
+        x2 = z_est[index_bbox, slice_fine_segm, self.y_lo, self.x_hi] * w_ylo_xhi
+        x3 = z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_lo] * w_yhi_xlo
+        x4 = z_est[index_bbox, slice_fine_segm, self.y_hi, self.x_hi] * w_yhi_xhi
+        z_est_sampled = x1 + x2 + x3 + x4
         return z_est_sampled
 
 
@@ -309,10 +376,6 @@ class PackedChartBasedAnnotations:
     point_bbox_indices: torch.Tensor
     bbox_indices: torch.Tensor
 
-    fine_segm_p: Optional[torch.Tensor]
-    u_p: Optional[torch.Tensor]
-    v_p: Optional[torch.Tensor]
-
 
 class ChartBasedAnnotationsAccumulator(AnnotationsAccumulator):
     """
@@ -334,10 +397,6 @@ class ChartBasedAnnotationsAccumulator(AnnotationsAccumulator):
         self.bbox_indices = []
         self.nxt_bbox_with_dp_index = 0
         self.nxt_bbox_index = 0
-
-        self.s_p = []
-        self.u_p = []
-        self.v_p = []
 
     def accumulate(self, instances_one_image: Instances):
         """
@@ -392,13 +451,6 @@ class ChartBasedAnnotationsAccumulator(AnnotationsAccumulator):
         if hasattr(dp_gt, "segm"):
             self.s_gt.append(dp_gt.segm.unsqueeze(0))
 
-        if hasattr(dp_gt, "dp_p_segm"):
-            self.s_p.append(dp_gt.dp_p_segm.unsqueeze(0))
-        if hasattr(dp_gt, "dp_p_u"):
-            self.u_p.append(dp_gt.dp_p_u.unsqueeze(0))
-        if hasattr(dp_gt, "dp_p_v"):
-            self.v_p.append(dp_gt.dp_p_v.unsqueeze(0))
-        
         self.bbox_xywh_gt.append(box_xywh_gt.view(-1, 4))
         self.bbox_xywh_est.append(box_xywh_est.view(-1, 4))
         self.point_bbox_with_dp_indices.append(
@@ -429,15 +481,6 @@ class ChartBasedAnnotationsAccumulator(AnnotationsAccumulator):
             coarse_segm_gt=torch.cat(self.s_gt, 0)
             if len(self.s_gt) == len(self.bbox_xywh_gt)
             else None,
-            fine_segm_p=torch.cat(self.s_p, 0)
-            if len(self.s_p) == len(self.bbox_xywh_gt)
-            else None,
-            u_p=torch.cat(self.u_p, 0)
-            if len(self.u_p) == len(self.bbox_xywh_gt)
-            else None,
-            v_p=torch.cat(self.v_p, 0)
-            if len(self.v_p) == len(self.bbox_xywh_gt)
-            else None,
             bbox_xywh_gt=torch.cat(self.bbox_xywh_gt, 0),
             bbox_xywh_est=torch.cat(self.bbox_xywh_est, 0),
             point_bbox_with_dp_indices=torch.cat(self.point_bbox_with_dp_indices, 0).long(),
@@ -445,212 +488,6 @@ class ChartBasedAnnotationsAccumulator(AnnotationsAccumulator):
             bbox_indices=torch.as_tensor(
                 self.bbox_indices, dtype=torch.long, device=self.x_gt[0].device
             ).long(),
-        )
-
-
-@dataclass
-class BlockBasedAnnotations:
-    """
-    Packed annotations for chart-based model training. The following attributes
-    are defined:
-     - fine_segm_labels_gt (tensor [K] of `int64`): GT fine segmentation point labels
-     - x_gt (tensor [K] of `float32`): GT normalized X point coordinates
-     - y_gt (tensor [K] of `float32`): GT normalized Y point coordinates
-     - u_gt (tensor [K] of `float32`): GT point U values
-     - v_gt (tensor [K] of `float32`): GT point V values
-     - u_gt_cls (tensor [K] of 'int64'): GT block classification point u labels
-     - u_gt_offset (tensor [K] of 'float32'): GT u offset to the midpoint of the corresponding block
-     - v_gt_cls (tensor [K] of 'int64'): GT block classification point v labels
-     - v_gt_offset (tensor [K] of 'float32'): GT v offset to the midpoint of the corresponding block
-     - coarse_segm_gt (tensor [N, S, S] of `float32`): GT segmentation for bounding boxes
-     - bbox_xywh_gt (tensor [N, 4] of `float32`): selected GT bounding boxes in
-         XYWH format
-     - bbox_xywh_est (tensor [N, 4] of `float32`): selected matching estimated
-         bounding boxes in XYWH format
-     - point_bbox_with_dp_indices (tensor [K] of `int64`): indices of bounding boxes
-         with DensePose annotations that correspond to the point data
-     - point_bbox_indices (tensor [K] of `int64`): indices of bounding boxes
-         (not necessarily the selected ones with DensePose data) that correspond
-         to the point data
-     - bbox_indices (tensor [N] of `int64`): global indices of selected bounding
-         boxes with DensePose annotations; these indices could be used to access
-         features that are computed for all bounding boxes, not only the ones with
-         DensePose annotations.
-    Here K is the total number of points and N is the total number of instances
-    with DensePose annotations.
-    """
-
-    fine_segm_labels_gt: torch.Tensor
-    x_gt: torch.Tensor
-    y_gt: torch.Tensor
-    u_gt: torch.Tensor
-    v_gt: torch.Tensor
-    u_gt_cls: torch.Tensor
-    u_gt_offsets: torch.Tensor
-    v_gt_cls: torch.Tensor
-    v_gt_offsets: torch.Tensor
-    coarse_segm_gt: Optional[torch.Tensor]
-    bbox_xywh_gt: torch.Tensor
-    bbox_xywh_est: torch.Tensor
-    point_bbox_with_dp_indices: torch.Tensor
-    point_bbox_indices: torch.Tensor
-    bbox_indices: torch.Tensor
-
-    fine_segm_p: Optional[torch.Tensor]
-    u_p: Optional[torch.Tensor]
-    v_p: Optional[torch.Tensor]
-
-
-class BlockBasedAnnotationsAccumulator(AnnotationsAccumulator):
-    """
-    Accumulates annotations by batches that correspond to objects detected on
-    individual images. Can pack them together into single tensors.
-    """
-
-    def __init__(self, block_num):
-        self.i_gt = []
-        self.x_gt = []
-        self.y_gt = []
-        self.u_gt = []
-        self.v_gt = []
-        self.u_gt_cls = []
-        self.u_gt_offset = []
-        self.v_gt_cls = []
-        self.v_gt_offset = []
-        self.s_gt = []
-        self.bbox_xywh_gt = []
-        self.bbox_xywh_est = []
-        self.point_bbox_with_dp_indices = []
-        self.point_bbox_indices = []
-        self.bbox_indices = []
-        self.nxt_bbox_with_dp_index = 0
-        self.nxt_bbox_index = 0
-        self.block_num = block_num
-
-        self.s_p = []
-        self.u_p = []
-        self.v_p = []
-
-    def accumulate(self, instances_one_image: Instances):
-        """
-        Accumulate instances data for one image
-
-        Args:
-            instances_one_image (Instances): instances data to accumulate
-        """
-        boxes_xywh_est = BoxMode.convert(
-            instances_one_image.proposal_boxes.tensor.clone(), BoxMode.XYXY_ABS, BoxMode.XYWH_ABS
-        )
-        boxes_xywh_gt = BoxMode.convert(
-            instances_one_image.gt_boxes.tensor.clone(), BoxMode.XYXY_ABS, BoxMode.XYWH_ABS
-        )
-        n_matches = len(boxes_xywh_gt)
-        assert n_matches == len(
-            boxes_xywh_est
-        ), f"Got {len(boxes_xywh_est)} proposal boxes and {len(boxes_xywh_gt)} GT boxes"
-        if not n_matches:
-            # no detection - GT matches
-            return
-        if (
-            not hasattr(instances_one_image, "gt_densepose")
-            or instances_one_image.gt_densepose is None
-        ):
-            # no densepose GT for the detections, just increase the bbox index
-            self.nxt_bbox_index += n_matches
-            return
-        for box_xywh_est, box_xywh_gt, dp_gt in zip(
-            boxes_xywh_est, boxes_xywh_gt, instances_one_image.gt_densepose
-        ):
-            if (dp_gt is not None) and (len(dp_gt.x) > 0):
-                self._do_accumulate(box_xywh_gt, box_xywh_est, dp_gt)
-            self.nxt_bbox_index += 1
-
-    def _do_accumulate(
-        self, box_xywh_gt: torch.Tensor, box_xywh_est: torch.Tensor, dp_gt: DensePoseDataRelative
-    ):
-        """
-        Accumulate instances data for one image, given that the data is not empty
-
-        Args:
-            box_xywh_gt (tensor): GT bounding box
-            box_xywh_est (tensor): estimated bounding box
-            dp_gt (DensePoseDataRelative): GT densepose data
-        """
-        self.i_gt.append(dp_gt.i)
-        self.x_gt.append(dp_gt.x)
-        self.y_gt.append(dp_gt.y)
-        self.u_gt.append(dp_gt.u)
-        self.v_gt.append(dp_gt.v)
-        if hasattr(dp_gt, "segm"):
-            self.s_gt.append(dp_gt.segm.unsqueeze(0))
-
-        if hasattr(dp_gt, "dp_p_segm"):
-            self.s_p.append(dp_gt.dp_p_segm.unsqueeze(0))
-        if hasattr(dp_gt, "dp_p_u"):
-            self.u_p.append(dp_gt.dp_p_u.unsqueeze(0))
-        if hasattr(dp_gt, "dp_p_v"):
-            self.v_p.append(dp_gt.dp_p_v.unsqueeze(0))
-
-        self.bbox_xywh_gt.append(box_xywh_gt.view(-1, 4))
-        self.bbox_xywh_est.append(box_xywh_est.view(-1, 4))
-        self.point_bbox_with_dp_indices.append(
-            torch.full_like(dp_gt.i, self.nxt_bbox_with_dp_index)
-        )
-        self.point_bbox_indices.append(torch.full_like(dp_gt.i, self.nxt_bbox_index))
-        self.bbox_indices.append(self.nxt_bbox_index)
-        self.nxt_bbox_with_dp_index += 1
-
-    def pack(self) -> Optional[BlockBasedAnnotations]:
-        """
-        Pack data into tensors
-        """
-        if not len(self.i_gt):
-            # TODO:
-            # returning proper empty annotations would require
-            # creating empty tensors of appropriate shape and
-            # type on an appropriate device;
-            # we return None so far to indicate empty annotations
-            return None
-
-        i_gt = torch.cat(self.i_gt, 0).long()
-        u_gt = torch.cat(self.u_gt, 0)
-        v_gt = torch.cat(self.v_gt, 0)
-
-        block_width = torch.tensor(1. / self.block_num, device=u_gt.device)
-        block_center = torch.linspace(block_width / 2, 1. - block_width / 2, self.block_num, device=u_gt.device)
-        u_gt_cls, u_gt_offsets = uv_to_blocks(u_gt, block_width, block_center, i_gt-1, self.block_num)
-        v_gt_cls, v_gt_offsets = uv_to_blocks(v_gt, block_width, block_center, i_gt-1, self.block_num)
-
-        return BlockBasedAnnotations(
-            fine_segm_labels_gt=torch.cat(self.i_gt, 0).long(),
-            x_gt=torch.cat(self.x_gt, 0),
-            y_gt=torch.cat(self.y_gt, 0),
-            u_gt=u_gt,
-            v_gt=v_gt,
-            # ignore segmentation annotations, if not all the instances contain those
-            coarse_segm_gt=torch.cat(self.s_gt, 0)
-            if len(self.s_gt) == len(self.bbox_xywh_gt)
-            else None,
-            fine_segm_p=torch.cat(self.s_p, 0)
-            if len(self.s_p) == len(self.bbox_xywh_gt)
-            else None,
-            u_p=torch.cat(self.u_p, 0)
-            if len(self.u_p) == len(self.bbox_xywh_gt)
-            else None,
-            v_p=torch.cat(self.v_p, 0)
-            if len(self.v_p) == len(self.bbox_xywh_gt)
-            else None,
-            bbox_xywh_gt=torch.cat(self.bbox_xywh_gt, 0),
-            bbox_xywh_est=torch.cat(self.bbox_xywh_est, 0),
-            point_bbox_with_dp_indices=torch.cat(self.point_bbox_with_dp_indices, 0).long(),
-            point_bbox_indices=torch.cat(self.point_bbox_indices, 0).long(),
-            bbox_indices=torch.as_tensor(
-                self.bbox_indices, dtype=torch.long, device=self.x_gt[0].device
-            ).long(),
-            u_gt_cls=u_gt_cls,
-            u_gt_offsets=u_gt_offsets,
-            v_gt_cls=v_gt_cls,
-            v_gt_offsets=v_gt_offsets,
         )
 
 
