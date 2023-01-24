@@ -202,7 +202,7 @@ class GeneralizedRCNNDP(nn.Module):
             proposals = [x["proposals"].to(self.device) for x in batched_inputs]
             proposal_losses = {}
 
-        _, detector_losses = self.roi_heads(images[:batch_size], label_features, proposals, gt_instances)
+        _, detector_losses = self.roi_heads(images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
 
         labeled_boxes = [x.labeled_boxes for x in un_instances]
         if do_flip:
@@ -214,7 +214,14 @@ class GeneralizedRCNNDP(nn.Module):
             unlabeled_loss = self.get_fake_unsup_loss()
         else:
             with torch.no_grad():
-                pseudo_labels = self.roi_heads.forward_with_given_boxes_train(label_features, labeled_boxes)
+                pseudo_labels = self.roi_heads.forward_with_given_boxes_train(label_features, labeled_boxes, pseudo=True)
+                # pseudo_segm = []
+                # for ins in gt_instances:
+                #     for d in ins.gt_densepose.densepose_datas:
+                #         if d is not None:
+                #             pseudo_segm.append(d.segm)
+                # pseudo_segm = (torch.stack(pseudo_segm, dim=0).unsqueeze(1).to(self.device) > 0).float()
+                # pseudo_labels.coarse_segm = F.interpolate(pseudo_segm, (112, 112)).long()
                 # pseudo_coarse = torch.cat([x["pseudo_segm"] for x in batched_inputs], dim=0).long().to(self.device)
                 # pseudo_labels.coarse_segm = pseudo_coarse
                 pseudo_labels.rotate(labeled_boxes, [x['angle'] for x in batched_inputs])
@@ -227,6 +234,7 @@ class GeneralizedRCNNDP(nn.Module):
                 self.visualize_training(batched_inputs, proposals)
 
         losses = {}
+
         losses.update(detector_losses)
         losses.update(proposal_losses)
         losses.update(unlabeled_loss)
@@ -314,16 +322,17 @@ class GeneralizedRCNNDP(nn.Module):
     def get_unlabeled_loss(self, pseudo_labels, prediction, do_flip=False):
         n_channels = 25
         # factor = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.1
-        if (self.iteration + 1) <= 80000:
-            factor = np.exp(-5 * (1 - self.iteration / 80000) ** 2) * 0.1
-        # elif (self.iteration + 1) >= 220000:
-        #     factor = np.exp(-12.5 * (1 - (self.iteration - 179999) / 40000) ** 2) * 0.1
+        if (self.iteration + 1) <= 160000:
+            factor = np.exp(-5 * (1 - self.iteration / 160000) ** 2) * 0.1
+        # elif (self.iteration + 1) >= 200000:
+        #     factor = 0.05
+        #     threshold = 0.85
         else:
-            factor = 0.05
+            factor = 0.1
+        threshold = 0.85
         # factor = 0.5
 
         # threshold = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.25 + 0.7
-        threshold = 0.85
 
         est = prediction.fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
         coarse_est = prediction.coarse_segm.permute(0, 2, 3, 1).reshape(-1, 2)
@@ -340,7 +349,7 @@ class GeneralizedRCNNDP(nn.Module):
             pseudo_fine_segm = pseudo_fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
             pos_index = pos_index.permute(0, 2, 3, 1).reshape(-1, n_channels + 1)
             pseudo_coarse_segm = pseudo_coarse_segm.permute(0, 2, 3, 1).reshape(-1, 2).argmax(dim=1)
-            # pseudo_coarse_segm = pseudo_coarse_segm.permute(0, 2, 3, 1).reshape(-1, 1)
+            # pseudo_coarse_segm = pseudo_coarse_segm.permute(0, 2, 3, 1).reshape(-1, )
 
             pred_index = pseudo_fine_segm.argmax(dim=1).long()
 
@@ -355,11 +364,10 @@ class GeneralizedRCNNDP(nn.Module):
         else:
             losses = {
                 "loss_unsup_coarse_segm": F.cross_entropy(
-                    coarse_est[coarse_pos_index], pseudo_coarse_segm[coarse_pos_index]
+                    coarse_est[coarse_pos_index], pseudo_coarse_segm[coarse_pos_index].long()
                 ) * 5.0 * factor,
             }
-
-        pos_index = pos_index * pseudo_coarse_segm * coarse_pos_index
+        pos_index = pos_index * pseudo_coarse_segm.bool() * coarse_pos_index
         pred_index = pred_index[pos_index]
         if pos_index.sum() <= 0:
             losses.update({
@@ -403,7 +411,7 @@ class GeneralizedRCNNDP(nn.Module):
                 # pseudo_sigma = (1 / (pseudo_sigma.clip(0., 1.) + 0.1))
 
             if do_flip:
-                # good_indices = (pseudo_u >= 0.) * (pseudo_u <= 1.) * (pseudo_v >= 0.) * (pseudo_v <= 1.)
+                good_indices = (pseudo_u >= 0.) * (pseudo_u <= 1.) * (pseudo_v >= 0.) * (pseudo_v <= 1.)
                 for i in range(1, len(POINT_LABEL_SYMMETRIES)):
                     indice = pred_index == POINT_LABEL_SYMMETRIES[i]
                     u_loc = (pseudo_u[indice] * 255).clip(0, 255).long()
@@ -411,8 +419,8 @@ class GeneralizedRCNNDP(nn.Module):
                     pseudo_u[indice] = self.uv_symmetries["U_transforms"][i - 1][v_loc, u_loc]
                     pseudo_v[indice] = self.uv_symmetries["V_transforms"][i - 1][v_loc, u_loc]
 
-                loss_u = F.mse_loss(u_est, pseudo_u, reduction='none') * pseudo_sigma
-                loss_v = F.mse_loss(v_est, pseudo_v, reduction='none') * pseudo_sigma
+                loss_u = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') * pseudo_sigma[good_indices]
+                loss_v = F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') * pseudo_sigma[good_indices]
             else:
                 loss_u = F.mse_loss(u_est, pseudo_u, reduction='none') * pseudo_sigma
                 loss_v = F.mse_loss(v_est, pseudo_v, reduction='none') * pseudo_sigma

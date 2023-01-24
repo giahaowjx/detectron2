@@ -121,7 +121,7 @@ class DensePoseROIHeads(StandardROIHeads):
         )
         self.densepose_losses = build_densepose_losses(cfg)
 
-    def _forward_densepose(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+    def _forward_densepose(self, features: Dict[str, torch.Tensor], instances: List[Instances], iteration=0):
         if not self.densepose_on:
             return {} if self.training else instances
 
@@ -142,7 +142,7 @@ class DensePoseROIHeads(StandardROIHeads):
                 densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs, features_dp)
 
                 densepose_loss_dict = self.densepose_losses(
-                    proposals, densepose_predictor_outputs
+                    proposals, densepose_predictor_outputs, iteration=iteration
                 )
                 return densepose_loss_dict
         else:
@@ -155,7 +155,7 @@ class DensePoseROIHeads(StandardROIHeads):
             features_dp = self.densepose_pooler(features_list, pred_boxes)
             if len(features_dp) > 0:
                 densepose_head_outputs = self.densepose_head(features_dp)
-                densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs, features_dp)
+                densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs)
             else:
                 densepose_predictor_outputs = None
 
@@ -168,12 +168,13 @@ class DensePoseROIHeads(StandardROIHeads):
         features: Dict[str, torch.Tensor],
         proposals: List[Instances],
         targets: Optional[List[Instances]] = None,
+        iteration=0,
     ):
         instances, losses = super().forward(images, features, proposals, targets)
         del targets, images
 
         if self.training:
-            losses.update(self._forward_densepose(features, instances))
+            losses.update(self._forward_densepose(features, instances, iteration=iteration))
         return instances, losses
 
     def forward_with_given_boxes(
@@ -184,14 +185,17 @@ class DensePoseROIHeads(StandardROIHeads):
         instances = self._forward_densepose(features, instances)
         return instances
 
-    def forward_with_given_boxes_train(self, features: Dict[str, torch.Tensor], boxes):
+    def forward_with_given_boxes_train(self, features: Dict[str, torch.Tensor], boxes, pseudo=False):
         features_list = [features[f] for f in self.in_features]
         if self.use_decoder:
             features_list = [self.decoder(features_list)]
         features_dp = self.densepose_pooler(features_list, boxes)
         if len(features_dp) > 0:
             densepose_head_outputs = self.densepose_head(features_dp)
-            densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs, features_dp)
+            if pseudo:
+                densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs, features_dp)
+            else:
+                densepose_predictor_outputs = self.densepose_predictor(densepose_head_outputs)
         else:
             densepose_predictor_outputs = None
         return densepose_predictor_outputs

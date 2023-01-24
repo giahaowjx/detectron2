@@ -110,14 +110,14 @@ class DensePoseChartPredictorOutput:
             for j in range(boxes_length):
                 self.coarse_segm[j + mark] = get_rotated_result(self.coarse_segm[j + mark], h[j], w[j], ag)
                 self.fine_segm[j + mark] = get_rotated_result(self.fine_segm[j + mark], h[j], w[j], ag)
-                self.u[j + mark] = get_rotated_result(self.u[j + mark], h[j], w[j], ag, inter=InterpolationMode.BILINEAR)
-                self.v[j + mark] = get_rotated_result(self.v[j + mark], h[j], w[j], ag, inter=InterpolationMode.BILINEAR)
+                self.u[j + mark] = get_rotated_result(self.u[j + mark], h[j], w[j], ag)
+                self.v[j + mark] = get_rotated_result(self.v[j + mark], h[j], w[j], ag)
                 self.crt_segm[j + mark] = get_rotated_result(self.crt_segm[j + mark], h[j], w[j], ag)
-                self.crt_sigma[j + mark] = get_rotated_result(self.crt_sigma[j + mark], h[j], w[j], ag, inter=InterpolationMode.BILINEAR)
+                self.crt_sigma[j + mark] = get_rotated_result(self.crt_sigma[j + mark], h[j], w[j], ag)
             mark += boxes_length
 
 
-def get_rotated_result(img, h, w, angle, inter=InterpolationMode.NEAREST):
-    img = resize(img, (int(h), int(w)))
-    img = rotate(img, angle, expand=True, interpolation=inter)
+def get_rotated_result(img, h, w, angle):
+    img = resize(img, (int(112), int(w/h * 112)))
+    img = rotate(img, angle, expand=True, interpolation=InterpolationMode.BILINEAR)
     return resize(img, (112, 112))

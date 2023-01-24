@@ -12,7 +12,7 @@ class EraseTransform(Transform):
     def __init__(self, patches: list, fill_val: int):
         super().__init__()
         self.patches = patches
-        self.fill_val = fill_val
+        self.fill_val = torch.tensor([103.53, 116.28, 123.675]) # fill_val
 
     def apply_image(self, img):
         if isinstance(img, np.ndarray):
@@ -47,18 +47,22 @@ class RandErase(Augmentation):
         self.img_fill_val = img_fill_val
         self.random_magnitude = random_magnitude
 
-    def get_transform(self, image, instances):
+    def get_transform(self, image, instances, label=False):
         h, w = image.shape[:2]
         # get magnitude
         patches = []
         if self.random_magnitude:
-            for i, bbox in enumerate(instances.unlabeled_boxes):
+            if label:
+                inst = instances.labeled_boxes
+            else:
+                inst = instances.unlabeled_boxes
+            for i, bbox in enumerate(inst):
                 x1, y1, x2, y2 = bbox.int()
                 if x1 != x2 and y1 != y2:
                     n_iterations = self._get_erase_cycle()
                     for _ in range(n_iterations):
                         ph, pw = self._get_patch_size(y2 - y1, x2 - x1)
-                        px, py = torch.randint(x1 - pw, x2 + pw, (1,)).clamp(0, w - pw), torch.randint(y1 - ph, y2 + ph, (1,)).clamp(0, h - ph)
+                        px, py = torch.randint(x1, x2, (1,)).clamp(0, w - pw), torch.randint(y1, y2, (1,)).clamp(0, h - ph)
                         patches.append([px, py, px + pw, py + ph])
         else:
             assert self.patches is not None

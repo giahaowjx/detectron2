@@ -5,7 +5,10 @@ import copy
 import logging
 from random import choice
 from typing import Any, Dict, List, Tuple
+
+import numpy as np
 import torch
+from PIL import ImageEnhance, Image
 
 from detectron2.data import MetadataCatalog
 from detectron2.data import transforms as T
@@ -48,11 +51,11 @@ def build_strong_augmentation(cfg, is_train):
             cfg.INPUT.ST_ANGLES, expand=True, sample_style="range"
         ))
 
-        min_size = cfg.INPUT.MIN_SIZE_PSEUDO
+        min_size = cfg.INPUT.MIN_SIZE_TRAIN
         max_size = cfg.INPUT.MAX_SIZE_TRAIN
         ratio = cfg.MODEL.SEMI.RATIO
 
-        random_resize = ResizeShortestEdge(min_size, max_size, ratio, 'range')
+        random_resize = ResizeShortestEdge(min_size, max_size, ratio, 'choice')
         result.append(random_resize)
         logger.info("DensePose-specific strong augmentation used in training. ")
     return result
@@ -121,7 +124,7 @@ class DatasetMapper:
 
         image, weak_transforms = T.apply_transform_gens(self.augmentation, image)
         image_shape = image.shape[:2]  # h, w
-        dataset_dict["image"] = torch.as_tensor(image.transpose(2, 0, 1).astype("float32"))
+        # dataset_dict["image"] = torch.as_tensor(image.transpose(2, 0, 1).astype("float32"))
 
         if not self.is_train:
             dataset_dict.pop("annotations", None)
@@ -139,6 +142,8 @@ class DatasetMapper:
             strong_image, strong_transforms = T.apply_transform_gens(self.strong_augmentation, image.copy())
             strong_shape = strong_image.shape[:2]
             # dataset_dict["un_image"] = torch.as_tensor(strong_image.transpose(2, 0, 1).astype("float32"))
+
+            strong_image = color_transform(strong_image)
 
             annos = [
                 self._transform_densepose(
@@ -168,6 +173,7 @@ class DatasetMapper:
 
             un_instances = un_instances[indices]
             dataset_dict["un_instances"] = un_instances[un_instances.unlabeled_boxes.nonempty()]
+            # dataset_dict["un_instances"] = un_instances
 
             # erase image
             erase_transform = self.random_erase.get_transform(strong_image, dataset_dict['un_instances'])
@@ -179,6 +185,11 @@ class DatasetMapper:
             for t in strong_transforms:
                 if isinstance(t, T.RotationTransform):
                     dataset_dict['angle'] = t.angle
+
+            erase_transform = self.random_erase.get_transform(strong_image, dataset_dict['un_instances'], label=True)
+            dataset_dict['image'] = torch.as_tensor(
+                erase_transform.apply_image(image).transpose(2, 0, 1).astype("float32")
+            )
         else:
             annos = [
                 self._transform_densepose(
@@ -247,3 +258,15 @@ class DatasetMapper:
             image_mask[y0:y1, x0:x1] = segm_aligned
             # segmentation for BitMask: np.array [H, W] of np.bool
             obj["segmentation"] = image_mask >= 0.5
+
+
+def color_transform(image, intensity_min=0.0, intensity_max=1.0):
+    if choice([True, False]):
+        op = ImageEnhance.Color
+        w = np.random.uniform(intensity_min, intensity_max)
+        return np.asarray(
+            op(Image.fromarray(image)).enhance(w),
+            dtype=image.dtype
+        )
+    else:
+        return image

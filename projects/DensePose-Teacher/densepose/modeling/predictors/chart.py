@@ -79,11 +79,9 @@ class DensePoseChartPredictor(nn.Module):
         )
         self.channels_squeeze = Conv2d(dim_in, dim_in // 2, kernel_size=1, stride=1)
 
-        self.uv_confidence = cfg.MODEL.ROI_DENSEPOSE_HEAD.UV_CONFIDENCE.ENABLED
-        if self.uv_confidence:
-            self.crt_sigma = ConvTranspose2d(
-                dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
-            )
+        self.crt_sigma = ConvTranspose2d(
+            dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+        )
 
         self.scale_factor = cfg.MODEL.ROI_DENSEPOSE_HEAD.UP_SCALE
         initialize_module_params(self)
@@ -103,11 +101,11 @@ class DensePoseChartPredictor(nn.Module):
             tensor_nchw, scale_factor=self.scale_factor, mode="bilinear", align_corners=False
         )
 
-    def forward(self, head_outputs: torch.Tensor, features_dp: torch.Tensor = None):
-        fine_segm = self.interp2d(self.index_uv_lowres(head_outputs))
+    def forward(self, head_outputs: torch.Tensor, features_dp=None):
         if features_dp is not None:
             crt_output = torch.cat((self.channels_squeeze(head_outputs.detach()), features_dp.detach()), dim=1)
             # crt_output = self.non_local(crt_output)
+            # crt_output = head_outputs
             for i in range(self.n_stacked_convs):
                 layer_name = _get_layer_name(i)
                 crt_output = getattr(self, layer_name)(crt_output)
@@ -122,7 +120,7 @@ class DensePoseChartPredictor(nn.Module):
 
         output = DensePoseChartPredictorOutput(
             coarse_segm=self.interp2d(self.ann_index_lowres(head_outputs)),
-            fine_segm=fine_segm,
+            fine_segm=self.interp2d(self.index_uv_lowres(head_outputs)),
             u=self.interp2d(self.u_lowres(head_outputs)),
             v=self.interp2d(self.v_lowres(head_outputs)),
             crt_segm=crt_segm,

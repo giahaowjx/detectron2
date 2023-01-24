@@ -75,7 +75,7 @@ class DensePoseChartLoss:
         self.w_crt_sigma = cfg.MODEL.SEMI.COR.SIGMA_WEIGHTS
 
     def __call__(
-        self, proposals_with_gt: List[Instances], densepose_predictor_outputs: Any, **kwargs
+        self, proposals_with_gt: List[Instances], densepose_predictor_outputs: Any, iteration=0, **kwargs
     ) -> LossDict:
 
         if not len(proposals_with_gt):
@@ -113,6 +113,7 @@ class DensePoseChartLoss:
             packed_annotations,
             interpolator,
             j_valid_fg,  # pyre-ignore[6]
+            iteration
         )
 
         return {**losses_uv, **losses_segm}
@@ -184,6 +185,7 @@ class DensePoseChartLoss:
         packed_annotations: Any,
         interpolator: BilinearInterpolationHelper,
         j_valid_fg: torch.Tensor,
+        iteration,
     ) -> LossDict:
         fine_segm_gt = packed_annotations.fine_segm_labels_gt[
             interpolator.j_valid  # pyre-ignore[16]
@@ -239,9 +241,16 @@ class DensePoseChartLoss:
         # coarse_weights = coarse_segm_crt_gt.sum() / (~coarse_segm_crt_gt).sum()
         # coarse_segm_loss[~coarse_segm_crt_gt] *= coarse_weights
 
+        if (iteration + 1) >= 160000:
+            factor = 10.0
+        elif (iteration + 1) >= 80000:
+            factor = 5.0
+        else:
+            factor = 1.0
+
         loss.update({
-            "loss_correction_I": crt_fine_segm_loss.mean() * self.w_crt_segm,
-            "loss_correction_S": coarse_segm_loss.mean() * self.w_crt_segm
+            "loss_correction_I": crt_fine_segm_loss.mean() * self.w_crt_segm * factor,
+            "loss_correction_S": coarse_segm_loss.mean() * self.w_crt_segm * factor
         })
 
         return loss

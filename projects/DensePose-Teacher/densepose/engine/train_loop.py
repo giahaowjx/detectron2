@@ -64,9 +64,7 @@ class SimpleTrainer(TrainerBase):
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
-        """
-        Firstly, Use teacher model to get pseudo labels
-        """
+        # produce pseudo label
         self.student_model.module.update_iteration(self.iter)
 
         loss_dict = self.student_model(data)

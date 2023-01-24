@@ -95,7 +95,7 @@ class Trainer(TrainerBase):
         optimizer = self.build_optimizer(cfg, student_model)
         data_loader = self.build_train_loader(cfg)
 
-        student_model = create_ddp_model(student_model, broadcast_buffers=False)
+        student_model = create_ddp_model(student_model)
 
         # get data augmentation for student model input
         # strong_aug = []
