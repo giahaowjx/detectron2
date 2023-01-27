@@ -124,7 +124,7 @@ class DatasetMapper:
 
         image, weak_transforms = T.apply_transform_gens(self.augmentation, image)
         image_shape = image.shape[:2]  # h, w
-        # dataset_dict["image"] = torch.as_tensor(image.transpose(2, 0, 1).astype("float32"))
+        dataset_dict["image"] = torch.as_tensor(image.transpose(2, 0, 1).astype("float32"))
 
         if not self.is_train:
             dataset_dict.pop("annotations", None)
@@ -143,7 +143,7 @@ class DatasetMapper:
             strong_shape = strong_image.shape[:2]
             # dataset_dict["un_image"] = torch.as_tensor(strong_image.transpose(2, 0, 1).astype("float32"))
 
-            strong_image = color_transform(strong_image)
+            # strong_image = color_transform(strong_image)
 
             annos = [
                 self._transform_densepose(
@@ -160,7 +160,7 @@ class DatasetMapper:
                 self._add_densepose_masks_as_segmentation(annos, strong_shape)
 
             instances = utils.annotations_to_instances(annos, image_shape)
-            un_instances = utils.annotations_to_instances(annos, strong_shape, unsup=True, threshold=self.threshold)
+            # un_instances = utils.annotations_to_instances(annos, strong_shape, unsup=True, threshold=self.threshold)
 
             densepose_annotations = [obj.get("densepose") for obj in annos]
             if densepose_annotations and not all(v is None for v in densepose_annotations):
@@ -168,28 +168,25 @@ class DatasetMapper:
                     densepose_annotations, instances.gt_boxes, strong_shape
                 )
 
-            dataset_dict["instances"] = instances[instances.gt_boxes.nonempty()]
             indices = [x is not None for x in instances.gt_densepose.densepose_datas]
+            instances.gt_indices = torch.tensor(indices, dtype=torch.bool)
+            dataset_dict["instances"] = instances[instances.gt_boxes.nonempty()]
 
-            un_instances = un_instances[indices]
-            dataset_dict["un_instances"] = un_instances[un_instances.unlabeled_boxes.nonempty()]
+            # un_instances = un_instances[indices]
+            # dataset_dict["un_instances"] = un_instances[un_instances.unlabeled_boxes.nonempty()]
             # dataset_dict["un_instances"] = un_instances
 
             # erase image
-            erase_transform = self.random_erase.get_transform(strong_image, dataset_dict['un_instances'])
+            erase_transform = self.random_erase.get_transform(strong_image, dataset_dict['instances'])
             dataset_dict['un_image'] = torch.as_tensor(
                 erase_transform.apply_image(strong_image).transpose(2, 0, 1).astype("float32")
             )
 
+            dataset_dict['transform'] = strong_transforms
             dataset_dict['angle'] = 0
             for t in strong_transforms:
                 if isinstance(t, T.RotationTransform):
                     dataset_dict['angle'] = t.angle
-
-            erase_transform = self.random_erase.get_transform(strong_image, dataset_dict['un_instances'], label=True)
-            dataset_dict['image'] = torch.as_tensor(
-                erase_transform.apply_image(image).transpose(2, 0, 1).astype("float32")
-            )
         else:
             annos = [
                 self._transform_densepose(

@@ -23,6 +23,7 @@ from detectron2.modeling.meta_arch.build import META_ARCH_REGISTRY
 
 from densepose.structures.image_list import ImageList
 from densepose.structures import DensePoseTransformData
+from densepose.modeling.losses.utils import resample_data
 
 __all__ = ["GeneralizedRCNNDP"]
 
@@ -86,6 +87,7 @@ class GeneralizedRCNNDP(nn.Module):
         self.uv_symmetries = DensePoseTransformData.load(
             densepose_transform_data_fpath
         ).uv_symmetries
+        self.heatmap_size = 112
 
     @classmethod
     def from_config(cls, cfg):
@@ -183,10 +185,14 @@ class GeneralizedRCNNDP(nn.Module):
         images = self.preprocess_image(batched_inputs, do_flip=do_flip)
         if "instances" in batched_inputs[0]:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            un_instances = [x["un_instances"].to(self.device) for x in batched_inputs]
+            # un_instances = [x["un_instances"].to(self.device) for x in batched_inputs]
+            transforms = [x["transform"] for x in batched_inputs]
         else:
             gt_instances = None
-            un_instances = None
+            # un_instances = None
+            transforms = None
+
+        strong_shape = [x['un_image'].shape[1:] for x in batched_inputs]
 
         features = self.backbone(images.tensor)
         batch_size = images.tensor.shape[0] // 2
@@ -202,13 +208,15 @@ class GeneralizedRCNNDP(nn.Module):
             proposals = [x["proposals"].to(self.device) for x in batched_inputs]
             proposal_losses = {}
 
-        _, detector_losses = self.roi_heads(images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
+        _, detector_losses, boxes = self.roi_heads(images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
 
-        labeled_boxes = [x.labeled_boxes for x in un_instances]
+        labeled_boxes = [x.gt_boxes[x.gt_indices] for x in boxes]
+        proposals_boxes = self.get_proposals_boxes(boxes, transforms, strong_shape)
         if do_flip:
-            unlabeled_boxes = [x.unlabeled_boxes.h_flip(x.image_size[1]) for x in un_instances]
+            unlabeled_boxes = [x.gt_unlabeled_boxes.h_flip(strong_shape[i][1]) for i, x in enumerate(boxes)]
+            proposals_boxes = [x.h_flip(strong_shape[i][1]) for i, x in enumerate(proposals_boxes)]
         else:
-            unlabeled_boxes = [x.unlabeled_boxes for x in un_instances]
+            unlabeled_boxes = [x.gt_unlabeled_boxes[x.gt_indices] for x in boxes]
 
         if len(labeled_boxes) <= 0 or len(unlabeled_boxes) <= 0:
             unlabeled_loss = self.get_fake_unsup_loss()
@@ -225,8 +233,9 @@ class GeneralizedRCNNDP(nn.Module):
                 # pseudo_coarse = torch.cat([x["pseudo_segm"] for x in batched_inputs], dim=0).long().to(self.device)
                 # pseudo_labels.coarse_segm = pseudo_coarse
                 pseudo_labels.rotate(labeled_boxes, [x['angle'] for x in batched_inputs])
-            prediction = self.roi_heads.forward_with_given_boxes_train(features, unlabeled_boxes)
-            unlabeled_loss = self.get_unlabeled_loss(pseudo_labels, prediction, do_flip=do_flip)
+
+            prediction = self.roi_heads.forward_with_given_boxes_train(features, proposals_boxes)
+            unlabeled_loss = self.get_unlabeled_loss(pseudo_labels, prediction, unlabeled_boxes, proposals_boxes, do_flip=do_flip)
 
         if self.vis_period > 0:
             storage = get_event_storage()
@@ -275,7 +284,7 @@ class GeneralizedRCNNDP(nn.Module):
                 assert "proposals" in batched_inputs[0]
                 proposals = [x["proposals"].to(self.device) for x in batched_inputs]
 
-            results, _ = self.roi_heads(images, features, proposals, None)
+            results, _, _ = self.roi_heads(images, features, proposals, None)
         else:
             detected_instances = [x.to(self.device) for x in detected_instances]
             results = self.roi_heads.forward_with_given_boxes(features, detected_instances)
@@ -319,7 +328,7 @@ class GeneralizedRCNNDP(nn.Module):
             processed_results.append({"instances": r})
         return processed_results
 
-    def get_unlabeled_loss(self, pseudo_labels, prediction, do_flip=False):
+    def get_unlabeled_loss(self, pseudo_labels, prediction, unlabeled_boxes, proposals_boxes, do_flip=False):
         n_channels = 25
         # factor = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.1
         if (self.iteration + 1) <= 160000:
@@ -328,11 +337,14 @@ class GeneralizedRCNNDP(nn.Module):
         #     factor = 0.05
         #     threshold = 0.85
         else:
-            factor = 0.1
+            factor = 0.05
         threshold = 0.85
         # factor = 0.5
 
         # threshold = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.25 + 0.7
+
+        boxes_gt = torch.cat([x.tensor for x in unlabeled_boxes], 0)
+        boxes_est = torch.cat([x.tensor for x in proposals_boxes], 0)
 
         est = prediction.fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
         coarse_est = prediction.coarse_segm.permute(0, 2, 3, 1).reshape(-1, 2)
@@ -346,6 +358,37 @@ class GeneralizedRCNNDP(nn.Module):
                 pseudo_fine_segm = pseudo_labels.fine_segm
                 pos_index = pseudo_labels.crt_segm
                 pseudo_coarse_segm = pseudo_labels.coarse_segm
+
+            pseudo_fine_segm = resample_data(
+                pseudo_fine_segm,
+                boxes_gt,
+                boxes_est,
+                self.heatmap_size,
+                self.heatmap_size,
+                mode="nearest",
+                padding_mode="zeros",
+            )
+
+            pseudo_coarse_segm = resample_data(
+                pseudo_coarse_segm,
+                boxes_gt,
+                boxes_est,
+                self.heatmap_size,
+                self.heatmap_size,
+                mode="nearest",
+                padding_mode="zeros",
+            )
+
+            pos_index = resample_data(
+                pos_index,
+                boxes_gt,
+                boxes_est,
+                self.heatmap_size,
+                self.heatmap_size,
+                mode="nearest",
+                padding_mode="zeros",
+            )
+
             pseudo_fine_segm = pseudo_fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
             pos_index = pos_index.permute(0, 2, 3, 1).reshape(-1, n_channels + 1)
             pseudo_coarse_segm = pseudo_coarse_segm.permute(0, 2, 3, 1).reshape(-1, 2).argmax(dim=1)
@@ -399,6 +442,37 @@ class GeneralizedRCNNDP(nn.Module):
                     pseudo_u = pseudo_labels.u
                     pseudo_v = pseudo_labels.v
                     pseudo_sigma = pseudo_labels.crt_sigma
+
+                pseudo_u = resample_data(
+                    pseudo_u,
+                    boxes_gt,
+                    boxes_est,
+                    self.heatmap_size,
+                    self.heatmap_size,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                )
+
+                pseudo_v = resample_data(
+                    pseudo_v,
+                    boxes_gt,
+                    boxes_est,
+                    self.heatmap_size,
+                    self.heatmap_size,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                )
+
+                pseudo_sigma = resample_data(
+                    pseudo_sigma,
+                    boxes_gt,
+                    boxes_est,
+                    self.heatmap_size,
+                    self.heatmap_size,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                )
+
                 pseudo_u = pseudo_u.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
                 pseudo_v = pseudo_v.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
                 pseudo_sigma = pseudo_sigma.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
@@ -439,3 +513,11 @@ class GeneralizedRCNNDP(nn.Module):
             "loss_unsup_u": 0,
             "loss_unsup_v": 0,
         }
+
+    def get_proposals_boxes(self, boxes, transforms, strong_shape):
+        proposals_boxes = [x.proposal_boxes[x.gt_indices] for x in boxes]
+        for i in range(len(proposals_boxes)):
+            proposals_boxes[i] = transforms[i].apply_box(np.array(proposals_boxes[i].tensor.cpu())).clip(min=0)
+            proposals_boxes[i] = Boxes(np.minimum(proposals_boxes[i], list(strong_shape[i] + strong_shape[i])[::-1])).to(self.device)
+
+        return proposals_boxes

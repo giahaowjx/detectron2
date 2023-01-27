@@ -241,16 +241,9 @@ class DensePoseChartLoss:
         # coarse_weights = coarse_segm_crt_gt.sum() / (~coarse_segm_crt_gt).sum()
         # coarse_segm_loss[~coarse_segm_crt_gt] *= coarse_weights
 
-        if (iteration + 1) >= 160000:
-            factor = 10.0
-        elif (iteration + 1) >= 80000:
-            factor = 5.0
-        else:
-            factor = 1.0
-
         loss.update({
-            "loss_correction_I": crt_fine_segm_loss.mean() * self.w_crt_segm * factor,
-            "loss_correction_S": coarse_segm_loss.mean() * self.w_crt_segm * factor
+            "loss_correction_I": crt_fine_segm_loss.mean() * self.w_crt_segm,
+            "loss_correction_S": coarse_segm_loss.mean() * self.w_crt_segm
         })
 
         return loss

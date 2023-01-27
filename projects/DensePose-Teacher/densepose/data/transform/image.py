@@ -52,11 +52,7 @@ class RandErase(Augmentation):
         # get magnitude
         patches = []
         if self.random_magnitude:
-            if label:
-                inst = instances.labeled_boxes
-            else:
-                inst = instances.unlabeled_boxes
-            for i, bbox in enumerate(inst):
+            for i, bbox in enumerate(instances.gt_unlabeled_boxes):
                 x1, y1, x2, y2 = bbox.int()
                 if x1 != x2 and y1 != y2:
                     n_iterations = self._get_erase_cycle()
