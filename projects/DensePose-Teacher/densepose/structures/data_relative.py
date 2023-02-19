@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.nn import functional as F
+from torchvision.transforms.functional import rotate
 
 from densepose.data.meshes.catalog import MeshCatalog
 from densepose.structures.mesh import load_mesh_symmetry
@@ -51,19 +52,19 @@ class DensePoseDataRelative(object):
     MASK_SIZE = 256
 
     # Key for pseudo coarse segm labels
-    PSEUDO_COARSE_SEGM = "pseudo_coarse_segm"
-    PSEUDO_FINE_SEGM = "pseudo_fine_segm"
-    # Key for pseudo u coordinates
-    PSEUDO_U = "pseudo_u"
-    # Key for pseudo v coordinates
-    PSEUDO_V = "pseudo_v"
+    # PSEUDO_COARSE_SEGM = "pseudo_coarse_segm"
+    # PSEUDO_FINE_SEGM = "pseudo_fine_segm"
+    # # Key for pseudo u coordinates
+    # PSEUDO_U = "pseudo_u"
+    # # Key for pseudo v coordinates
+    # PSEUDO_V = "pseudo_v"
     # Size of pseudo labels
     PSEUDO_MASK_SIZE = 112
 
     # Key for pseudo embeddings
-    PSEUDO_MASK = "pseudo_mask"
-    # Key for pseudo sigma
-    PSEUDO_SIGMA = "pseudo_sigma"
+    # PSEUDO_MASK = "pseudo_mask"
+    # # Key for pseudo sigma
+    # PSEUDO_SIGMA = "pseudo_sigma"
 
     def __init__(self, annotation, cleanup=False):
         self.x = torch.as_tensor(annotation[DensePoseDataRelative.X_KEY])
@@ -101,18 +102,18 @@ class DensePoseDataRelative(object):
                 setattr(new_data, attr, getattr(self, attr).to(device))
         if hasattr(self, "mesh_id"):
             new_data.mesh_id = self.mesh_id
-        if hasattr(self, "pseudo_coarse_segm"):
-            new_data.pseudo_coarse_segm = self.pseudo_coarse_segm
-        if hasattr(self, "pseudo_fine_segm"):
-            new_data.pseudo_fine_segm = self.pseudo_fine_segm
-        if hasattr(self, "pseudo_u"):
-            new_data.pseudo_u = self.pseudo_u
-        if hasattr(self, "pseudo_v"):
-            new_data.pseudo_v = self.pseudo_v
-        if hasattr(self, "pseudo_mask"):
-            new_data.pseudo_mask = self.pseudo_mask
-        if hasattr(self, "pseudo_sigma"):
-            new_data.pseudo_sigma = self.pseudo_sigma
+        # if hasattr(self, "pseudo_coarse_segm"):
+        #     new_data.pseudo_coarse_segm = self.pseudo_coarse_segm
+        # if hasattr(self, "pseudo_fine_segm"):
+        #     new_data.pseudo_fine_segm = self.pseudo_fine_segm
+        # if hasattr(self, "pseudo_u"):
+        #     new_data.pseudo_u = self.pseudo_u
+        # if hasattr(self, "pseudo_v"):
+        #     new_data.pseudo_v = self.pseudo_v
+        # if hasattr(self, "pseudo_mask"):
+        #     new_data.pseudo_mask = self.pseudo_mask
+        # if hasattr(self, "pseudo_sigma"):
+        #     new_data.pseudo_sigma = self.pseudo_sigma
         new_data.device = device
         return new_data
 
@@ -198,22 +199,22 @@ class DensePoseDataRelative(object):
             DensePoseDataRelative.S_KEY,
             DensePoseDataRelative.VERTEX_IDS_KEY,
             DensePoseDataRelative.MESH_NAME_KEY,
-            DensePoseDataRelative.PSEUDO_COARSE_SEGM,
-            DensePoseDataRelative.PSEUDO_FINE_SEGM,
-            DensePoseDataRelative.PSEUDO_U,
-            DensePoseDataRelative.PSEUDO_V,
-            DensePoseDataRelative.PSEUDO_MASK,
-            DensePoseDataRelative.PSEUDO_SIGMA
+            # DensePoseDataRelative.PSEUDO_COARSE_SEGM,
+            # DensePoseDataRelative.PSEUDO_FINE_SEGM,
+            # DensePoseDataRelative.PSEUDO_U,
+            # DensePoseDataRelative.PSEUDO_V,
+            # DensePoseDataRelative.PSEUDO_MASK,
+            # DensePoseDataRelative.PSEUDO_SIGMA
         ]:
             if key in annotation:
                 del annotation[key]
 
-    def apply_transform(self, transforms, densepose_transform_data):
-        self._transform_pts(transforms, densepose_transform_data)
+    def apply_transform(self, transforms, densepose_transform_data, bbox):
+        self._transform_pts(transforms, densepose_transform_data, bbox)
         if hasattr(self, "segm"):
-            self._transform_segm(transforms, densepose_transform_data)
+            self._transform_segm(transforms, densepose_transform_data, bbox)
 
-    def _transform_pts(self, transforms, dp_transform_data):
+    def _transform_pts(self, transforms, dp_transform_data, bbox):
         import detectron2.data.transforms as T
 
         # NOTE: This assumes that HorizFlipTransform is the only one that does flip
@@ -227,9 +228,13 @@ class DensePoseDataRelative(object):
 
         for t in transforms.transforms:
             if isinstance(t, T.RotationTransform):
-                xy_scale = np.array((t.w, t.h)) / DensePoseDataRelative.MASK_SIZE
-                xy = t.apply_coords(np.stack((self.x, self.y), axis=1) * xy_scale)
-                self.x, self.y = torch.tensor(xy / xy_scale, dtype=self.x.dtype).T
+                ubbox = t.apply_box(bbox)[0].clip(min=0)
+                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                uw, uh = ubbox[2] - ubbox[0], ubbox[3] - ubbox[1]
+                xy_scale = np.array((w, h)) / DensePoseDataRelative.MASK_SIZE
+                xy_result_scale = np.array((uw, uh)) / DensePoseDataRelative.MASK_SIZE
+                xy = t.apply_coords(np.stack((self.x, self.y), axis=1) * xy_scale + np.array((bbox[0], bbox[1])))
+                self.x, self.y = torch.tensor((xy - np.array((ubbox[0], ubbox[1]))) / xy_result_scale, dtype=self.x.dtype).T
 
     def _flip_iuv_semantics(self, dp_transform_data: DensePoseTransformData) -> None:
         i_old = self.i.clone()
@@ -256,7 +261,7 @@ class DensePoseDataRelative(object):
         )
         self.vertex_ids = mesh_symmetry["vertex_transforms"][self.vertex_ids]
 
-    def _transform_segm(self, transforms, dp_transform_data):
+    def _transform_segm(self, transforms, dp_transform_data, bbox):
         import detectron2.data.transforms as T
 
         # NOTE: This assumes that HorizFlipTransform is the only one that does flip
@@ -267,7 +272,7 @@ class DensePoseDataRelative(object):
 
         for t in transforms.transforms:
             if isinstance(t, T.RotationTransform):
-                self._transform_segm_rotation(t)
+                self._transform_segm_rotation(t, bbox)
 
     def _flip_segm_semantics(self, dp_transform_data):
         old_segm = self.segm.clone()
@@ -276,7 +281,8 @@ class DensePoseDataRelative(object):
             if mask_label_symmetries[i + 1] != i + 1:
                 self.segm[old_segm == i + 1] = mask_label_symmetries[i + 1]
 
-    def _transform_segm_rotation(self, rotation):
-        self.segm = F.interpolate(self.segm[None, None, :], (rotation.h, rotation.w)).numpy()
-        self.segm = torch.tensor(rotation.apply_segmentation(self.segm[0, 0]))[None, None, :]
+    def _transform_segm_rotation(self, rotation, bbox):
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        self.segm = F.interpolate(self.segm[None, None, :], (256, int(w * 256 / h)))
+        self.segm = rotate(self.segm, angle=rotation.angle, expand=True)
         self.segm = F.interpolate(self.segm, [DensePoseDataRelative.MASK_SIZE] * 2)[0, 0]

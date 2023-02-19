@@ -382,11 +382,10 @@ class Trainer(TrainerBase):
 
     @classmethod
     def single_person_test(
-            cls,
-            cfg: CfgNode,
-            model: nn.Module,
-            evaluators: Optional[Union[DatasetEvaluator, List[DatasetEvaluator]]] = None,
-            corrector=None,
+        cls,
+        cfg: CfgNode,
+        model: nn.Module,
+        evaluators: Optional[Union[DatasetEvaluator, List[DatasetEvaluator]]] = None,
     ):
         logger = logging.getLogger(__name__)
         if isinstance(evaluators, DatasetEvaluator):
@@ -398,7 +397,7 @@ class Trainer(TrainerBase):
 
         results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
-            data_loader = cls.build_test_loader(cfg, dataset_name)
+            data_loader = cls.build_test_loader(cfg, dataset_name, single=True)
             # When evaluators are passed in as arguments,
             # implicitly assume that evaluators can be created before data_loader.
             if evaluators is not None:
@@ -406,7 +405,6 @@ class Trainer(TrainerBase):
             else:
                 try:
                     # embedder = cls.extract_embedder_from_model(model)
-                    # evaluator = cls.build_evaluator(cfg, dataset_name, embedder=embedder)
                     evaluator = cls.build_evaluator(cfg, dataset_name, single=True)
                 except NotImplementedError:
                     logger.warn(
@@ -416,7 +414,7 @@ class Trainer(TrainerBase):
                     results[dataset_name] = {}
                     continue
             if cfg.DENSEPOSE_EVALUATION.DISTRIBUTED_INFERENCE or comm.is_main_process():
-                results_i = inference_single_on_dataset(model, data_loader, evaluator, corrector)
+                results_i = inference_single_on_dataset(model, data_loader, evaluator)
             else:
                 results_i = {}
             results[dataset_name] = results_i
@@ -518,8 +516,8 @@ class Trainer(TrainerBase):
         return maybe_add_gradient_clipping(cfg, optimizer)
 
     @classmethod
-    def build_test_loader(cls, cfg: CfgNode, dataset_name):
-        return build_detection_test_loader(cfg, dataset_name, mapper=DatasetMapper(cfg, False))
+    def build_test_loader(cls, cfg: CfgNode, dataset_name, single=False):
+        return build_detection_test_loader(cfg, dataset_name, mapper=DatasetMapper(cfg, False, single=single))
 
     @classmethod
     def build_train_loader(cls, cfg: CfgNode):

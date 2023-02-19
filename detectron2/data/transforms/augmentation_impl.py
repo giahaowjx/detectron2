@@ -276,10 +276,12 @@ class RandomRotation(Augmentation):
         self._init(locals())
 
     def get_transform(self, image):
+        if np.random.uniform(0., 1.) <= 0.5:
+            return NoOpTransform()
         h, w = image.shape[:2]
         center = None
         if self.is_range:
-            angle = np.random.uniform(self.angle[0], self.angle[1])
+            angle = int(np.random.uniform(self.angle[0], self.angle[1]))
             if self.center is not None:
                 center = (
                     np.random.uniform(self.center[0][0], self.center[1][0]),

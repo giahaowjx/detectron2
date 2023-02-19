@@ -101,7 +101,7 @@ class DensePoseChartPredictorOutput:
         for i in range(len(angle)):
             ag = angle[i]
             boxes_length = len(labeled_boxes[i])
-            if ag == 0:
+            if ag % 360 == 0:
                 mark += boxes_length
                 continue
             # do angle for pseudo labels
@@ -116,6 +116,13 @@ class DensePoseChartPredictorOutput:
                 self.crt_sigma[j + mark] = get_rotated_result(self.crt_sigma[j + mark], h[j], w[j], ag)
             mark += boxes_length
 
+    def indices(self, index):
+        self.coarse_segm = self.coarse_segm[index]
+        self.fine_segm = self.fine_segm[index]
+        self.u = self.u[index]
+        self.v = self.v[index]
+        self.crt_segm = self.crt_segm[index]
+        self.crt_sigma = self.crt_sigma[index]
 
 def get_rotated_result(img, h, w, angle):
     img = resize(img, (int(112), int(w/h * 112)))

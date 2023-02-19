@@ -179,7 +179,11 @@ class GeneralizedRCNNDP(nn.Module):
         for k in self.uv_symmetries.keys():
             self.uv_symmetries[k] = self.uv_symmetries[k].to(self.device)
 
-        # do_flip = choice([True, False])
+        # do_flip = choice([True, False, False])
+        # if torch.rand((1,)) < 0.25:
+        #     do_flip = True
+        # else:
+        #     do_flip = False
         do_flip = False
 
         images = self.preprocess_image(batched_inputs, do_flip=do_flip)
@@ -208,34 +212,41 @@ class GeneralizedRCNNDP(nn.Module):
             proposals = [x["proposals"].to(self.device) for x in batched_inputs]
             proposal_losses = {}
 
-        _, detector_losses, boxes = self.roi_heads(images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
+        _, detector_losses, proposals_instances, pseudo_labels = self.roi_heads(
+            images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
+        # _, detector_losses, proposals_instances = self.roi_heads(
+        #             images[:batch_size], label_features, proposals, gt_instances, iteration=self.iteration)
 
-        labeled_boxes = [x.gt_boxes[x.gt_indices] for x in boxes]
-        proposals_boxes = self.get_proposals_boxes(boxes, transforms, strong_shape)
-        if do_flip:
-            unlabeled_boxes = [x.gt_unlabeled_boxes.h_flip(strong_shape[i][1]) for i, x in enumerate(boxes)]
-            proposals_boxes = [x.h_flip(strong_shape[i][1]) for i, x in enumerate(proposals_boxes)]
+        # labeled_boxes = [x.gt_boxes[x.gt_indices] for x in proposals_instances]
+        # if do_flip:
+        #     unlabeled_boxes = [x.gt_unlabeled_boxes.h_flip(strong_shape[i][1]) for i, x in enumerate(proposals_instances)]
+        #     proposals_boxes = [x.h_flip(strong_shape[i][1]) for i, x in enumerate(proposals_boxes)]
+        # else:
+        # unlabeled_boxes = [x.gt_unlabeled_boxes[x.gt_indices] for x in proposals_instances]
+        labeled_boxes = [x.proposal_boxes[x.gt_indices] for x in proposals_instances]
+        unlabeled_boxes = self.get_proposals_boxes(labeled_boxes, transforms, strong_shape, do_flip=do_flip)
+        indices = torch.cat([x.gt_indices for x in proposals_instances], 0).to(self.device)
+        # strong_losses = self.roi_heads.forward_strong(features, proposals_instances, self.iteration)
+
+        # with torch.no_grad():
+        #     pseudo_labels = self.roi_heads.forward_with_given_boxes_train(label_features, labeled_boxes, pseudo=True)
+            # pseudo_segm = []
+            # for ins in gt_instances:
+            #     for d in ins.gt_densepose.densepose_datas:
+            #         if d is not None:
+            #             pseudo_segm.append(d.segm)
+            # pseudo_segm = (torch.stack(pseudo_segm, dim=0).unsqueeze(1).to(self.device) > 0).float()
+            # pseudo_labels.coarse_segm = F.interpolate(pseudo_segm, (112, 112)).long()
+            # pseudo_coarse = torch.cat([x["pseudo_segm"] for x in batched_inputs], dim=0).long().to(self.device)
+            # pseudo_labels.coarse_segm = pseudo_coarse
+
+        if indices.sum() <= 0:
+            unlabeled_loss = self.get_fake_unsup_loss(pseudo_labels)
         else:
-            unlabeled_boxes = [x.gt_unlabeled_boxes[x.gt_indices] for x in boxes]
-
-        if len(labeled_boxes) <= 0 or len(unlabeled_boxes) <= 0:
-            unlabeled_loss = self.get_fake_unsup_loss()
-        else:
-            with torch.no_grad():
-                pseudo_labels = self.roi_heads.forward_with_given_boxes_train(label_features, labeled_boxes, pseudo=True)
-                # pseudo_segm = []
-                # for ins in gt_instances:
-                #     for d in ins.gt_densepose.densepose_datas:
-                #         if d is not None:
-                #             pseudo_segm.append(d.segm)
-                # pseudo_segm = (torch.stack(pseudo_segm, dim=0).unsqueeze(1).to(self.device) > 0).float()
-                # pseudo_labels.coarse_segm = F.interpolate(pseudo_segm, (112, 112)).long()
-                # pseudo_coarse = torch.cat([x["pseudo_segm"] for x in batched_inputs], dim=0).long().to(self.device)
-                # pseudo_labels.coarse_segm = pseudo_coarse
-                pseudo_labels.rotate(labeled_boxes, [x['angle'] for x in batched_inputs])
-
-            prediction = self.roi_heads.forward_with_given_boxes_train(features, proposals_boxes)
-            unlabeled_loss = self.get_unlabeled_loss(pseudo_labels, prediction, unlabeled_boxes, proposals_boxes, do_flip=do_flip)
+            pseudo_labels.indices(indices)
+            pseudo_labels.rotate(labeled_boxes, [x['angle'] for x in batched_inputs])
+            prediction = self.roi_heads.forward_with_given_boxes_train(features, unlabeled_boxes)
+            unlabeled_loss = self.get_unlabeled_loss(pseudo_labels, prediction, do_flip=do_flip)
 
         if self.vis_period > 0:
             storage = get_event_storage()
@@ -243,6 +254,9 @@ class GeneralizedRCNNDP(nn.Module):
                 self.visualize_training(batched_inputs, proposals)
 
         losses = {}
+
+        # for k in strong_losses:
+        #     detector_losses[k] = (detector_losses[k] + strong_losses[k]) * 0.5
 
         losses.update(detector_losses)
         losses.update(proposal_losses)
@@ -284,7 +298,7 @@ class GeneralizedRCNNDP(nn.Module):
                 assert "proposals" in batched_inputs[0]
                 proposals = [x["proposals"].to(self.device) for x in batched_inputs]
 
-            results, _, _ = self.roi_heads(images, features, proposals, None)
+            results, _ = self.roi_heads(images, features, proposals, None)
         else:
             detected_instances = [x.to(self.device) for x in detected_instances]
             results = self.roi_heads.forward_with_given_boxes(features, detected_instances)
@@ -328,23 +342,30 @@ class GeneralizedRCNNDP(nn.Module):
             processed_results.append({"instances": r})
         return processed_results
 
-    def get_unlabeled_loss(self, pseudo_labels, prediction, unlabeled_boxes, proposals_boxes, do_flip=False):
+    def get_unlabeled_loss(self, pseudo_labels, prediction, do_flip=False):
         n_channels = 25
         # factor = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.1
-        if (self.iteration + 1) <= 160000:
-            factor = np.exp(-5 * (1 - self.iteration / 160000) ** 2) * 0.1
+        if (self.iteration + 1) <= 80000:
+            factor = np.exp(-5 * (1 - self.iteration / 80000) ** 2) * 0.1
+            threshold = np.exp(-5 * (1 - self.iteration / 80000) ** 2) * 0.15 + 0.8
         # elif (self.iteration + 1) >= 200000:
-        #     factor = 0.05
-        #     threshold = 0.85
+        #     factor = 0.1
+        # #     threshold = 0.85
         else:
-            factor = 0.05
-        threshold = 0.85
+            factor = 0.1
+            threshold = 0.95
+        # factor = 0.1
+        # if (self.iteration + 1) <= 200000:
+        #     threshold = 0.85
+        # else:
+        #     threshold = 0.95
+        # factor = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.1
         # factor = 0.5
 
-        # threshold = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.25 + 0.7
+        # threshold = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.5 + 0.5
 
-        boxes_gt = torch.cat([x.tensor for x in unlabeled_boxes], 0)
-        boxes_est = torch.cat([x.tensor for x in proposals_boxes], 0)
+        # boxes_gt = torch.cat([x.tensor for x in unlabeled_boxes], 0)
+        # boxes_est = torch.cat([x.tensor for x in proposals_boxes], 0)
 
         est = prediction.fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
         coarse_est = prediction.coarse_segm.permute(0, 2, 3, 1).reshape(-1, 2)
@@ -359,35 +380,35 @@ class GeneralizedRCNNDP(nn.Module):
                 pos_index = pseudo_labels.crt_segm
                 pseudo_coarse_segm = pseudo_labels.coarse_segm
 
-            pseudo_fine_segm = resample_data(
-                pseudo_fine_segm,
-                boxes_gt,
-                boxes_est,
-                self.heatmap_size,
-                self.heatmap_size,
-                mode="nearest",
-                padding_mode="zeros",
-            )
-
-            pseudo_coarse_segm = resample_data(
-                pseudo_coarse_segm,
-                boxes_gt,
-                boxes_est,
-                self.heatmap_size,
-                self.heatmap_size,
-                mode="nearest",
-                padding_mode="zeros",
-            )
-
-            pos_index = resample_data(
-                pos_index,
-                boxes_gt,
-                boxes_est,
-                self.heatmap_size,
-                self.heatmap_size,
-                mode="nearest",
-                padding_mode="zeros",
-            )
+            # pseudo_fine_segm = resample_data(
+            #     pseudo_fine_segm,
+            #     boxes_gt,
+            #     boxes_est,
+            #     self.heatmap_size,
+            #     self.heatmap_size,
+            #     mode="nearest",
+            #     padding_mode="zeros",
+            # )
+            #
+            # pseudo_coarse_segm = resample_data(
+            #     pseudo_coarse_segm,
+            #     boxes_gt,
+            #     boxes_est,
+            #     self.heatmap_size,
+            #     self.heatmap_size,
+            #     mode="nearest",
+            #     padding_mode="zeros",
+            # )
+            #
+            # pos_index = resample_data(
+            #     pos_index,
+            #     boxes_gt,
+            #     boxes_est,
+            #     self.heatmap_size,
+            #     self.heatmap_size,
+            #     mode="nearest",
+            #     padding_mode="zeros",
+            # )
 
             pseudo_fine_segm = pseudo_fine_segm.permute(0, 2, 3, 1).reshape(-1, n_channels)
             pos_index = pos_index.permute(0, 2, 3, 1).reshape(-1, n_channels + 1)
@@ -415,8 +436,6 @@ class GeneralizedRCNNDP(nn.Module):
         if pos_index.sum() <= 0:
             losses.update({
                 "loss_unsup_fine_segm": est.sum() * 0,
-                "loss_unsup_u": prediction.u.sum() * 0,
-                "loss_unsup_v": prediction.v.sum() * 0,
             })
         else:
             loss = F.cross_entropy(est[pos_index], pred_index.long(), reduction='mean')
@@ -424,6 +443,15 @@ class GeneralizedRCNNDP(nn.Module):
                 "loss_unsup_fine_segm": loss * factor
             })
 
+            # pos_index = pos_index * pseudo_coarse_segm.bool() * coarse_pos_index
+            # pred_index = pred_index[pos_index]
+
+        if pos_index.sum() <= 0:
+            losses.update({
+                "loss_unsup_u": prediction.u.sum() * 0,
+                "loss_unsup_v": prediction.v.sum() * 0,
+            })
+        else:
             u_est = prediction.u.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
             v_est = prediction.v.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
 
@@ -443,35 +471,35 @@ class GeneralizedRCNNDP(nn.Module):
                     pseudo_v = pseudo_labels.v
                     pseudo_sigma = pseudo_labels.crt_sigma
 
-                pseudo_u = resample_data(
-                    pseudo_u,
-                    boxes_gt,
-                    boxes_est,
-                    self.heatmap_size,
-                    self.heatmap_size,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                )
-
-                pseudo_v = resample_data(
-                    pseudo_v,
-                    boxes_gt,
-                    boxes_est,
-                    self.heatmap_size,
-                    self.heatmap_size,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                )
-
-                pseudo_sigma = resample_data(
-                    pseudo_sigma,
-                    boxes_gt,
-                    boxes_est,
-                    self.heatmap_size,
-                    self.heatmap_size,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                )
+                # pseudo_u = resample_data(
+                #     pseudo_u,
+                #     boxes_gt,
+                #     boxes_est,
+                #     self.heatmap_size,
+                #     self.heatmap_size,
+                #     mode="bilinear",
+                #     padding_mode="zeros",
+                # )
+                #
+                # pseudo_v = resample_data(
+                #     pseudo_v,
+                #     boxes_gt,
+                #     boxes_est,
+                #     self.heatmap_size,
+                #     self.heatmap_size,
+                #     mode="bilinear",
+                #     padding_mode="zeros",
+                # )
+                #
+                # pseudo_sigma = resample_data(
+                #     pseudo_sigma,
+                #     boxes_gt,
+                #     boxes_est,
+                #     self.heatmap_size,
+                #     self.heatmap_size,
+                #     mode="bilinear",
+                #     padding_mode="zeros",
+                # )
 
                 pseudo_u = pseudo_u.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
                 pseudo_v = pseudo_v.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
@@ -481,7 +509,10 @@ class GeneralizedRCNNDP(nn.Module):
                 pseudo_v = pseudo_v[batch_indices, pred_index]#.clamp(0., 1.)
 
                 pseudo_sigma = pseudo_sigma[batch_indices, pred_index]
+                # pseudo_sigma += torch.sqrt((pseudo_u - u_est) ** 2 + (pseudo_v - v_est) ** 2)
+                # pseudo_sigma /= 2.
                 pseudo_sigma = torch.pow(1 - pseudo_sigma.clamp(0., 1.), 9)
+                # pseudo_sigma = 1. - torch.pow(1 - pseudo_sigma.clamp(0., 1.), beta)
                 # pseudo_sigma = (1 / (pseudo_sigma.clip(0., 1.) + 0.1))
 
             if do_flip:
@@ -495,29 +526,41 @@ class GeneralizedRCNNDP(nn.Module):
 
                 loss_u = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') * pseudo_sigma[good_indices]
                 loss_v = F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') * pseudo_sigma[good_indices]
+                # loss_uv = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') + \
+                #           F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') + 0.01
+                # loss_uv = torch.sqrt(loss_uv) * pseudo_sigma[good_indices]
             else:
                 loss_u = F.mse_loss(u_est, pseudo_u, reduction='none') * pseudo_sigma
                 loss_v = F.mse_loss(v_est, pseudo_v, reduction='none') * pseudo_sigma
+                # loss_uv = F.mse_loss(u_est, pseudo_u, reduction='none') + F.mse_loss(v_est, pseudo_v, reduction='none') + 0.01
+                # loss_uv = torch.sqrt(loss_uv) * pseudo_sigma
 
             losses.update({
                 "loss_unsup_u": loss_u.sum() * 0.01 * factor,
                 "loss_unsup_v": loss_v.sum() * 0.01 * factor
+                # "loss_unsup_uv": loss_uv.sum() * 0.0005 * factor
             })
 
         return losses
 
-    def get_fake_unsup_loss(self):
+    def get_fake_unsup_loss(self, pseudo):
         return {
-            "loss_unsup_coarse_segm": 0,
-            "loss_unsup_fine_segm": 0,
-            "loss_unsup_u": 0,
-            "loss_unsup_v": 0,
+            "loss_unsup_coarse_segm": pseudo.coarse_segm.sum() * 0,
+            "loss_unsup_fine_segm": pseudo.fine_segm.sum() * 0,
+            "loss_unsup_u": pseudo.u.sum() * 0,
+            "loss_unsup_v": pseudo.v.sum() * 0,
+            # "loss_unsup_uv": (pseudo.u.sum() * 0) + (pseudo.v.sum() * 0)
         }
 
-    def get_proposals_boxes(self, boxes, transforms, strong_shape):
-        proposals_boxes = [x.proposal_boxes[x.gt_indices] for x in boxes]
-        for i in range(len(proposals_boxes)):
-            proposals_boxes[i] = transforms[i].apply_box(np.array(proposals_boxes[i].tensor.cpu())).clip(min=0)
-            proposals_boxes[i] = Boxes(np.minimum(proposals_boxes[i], list(strong_shape[i] + strong_shape[i])[::-1])).to(self.device)
-
+    def get_proposals_boxes(self, boxes, transforms, strong_shape, do_flip):
+        proposals_boxes = []
+        for i, p in enumerate(boxes):
+            box = transforms[i].apply_box(np.array(boxes[i].tensor.cpu())).clip(min=0)
+            box = Boxes(np.minimum(box, list(strong_shape[i] + strong_shape[i])[::-1])).to(self.device)
+            if do_flip:
+                box = box.h_flip(strong_shape[i][1])
+            proposals_boxes.append(box)
+            # p.proposal_boxes = Boxes(np.minimum(box, list(strong_shape[i] + strong_shape[i])[::-1])).to(self.device)
+            # p.gt_boxes = p.gt_unlabeled_boxes
+            # p.gt_densepose = p.gt_undensepose
         return proposals_boxes

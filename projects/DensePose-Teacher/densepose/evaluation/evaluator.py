@@ -269,33 +269,6 @@ def densepose_chart_predictions_to_dict(instances):
     return results
 
 
-def densepose_block_predictions_to_dict(instances, block_num):
-    segmentations = ToMaskConverter.convert(
-        instances.pred_densepose, instances.pred_boxes, instances.image_size
-    )
-
-    results = []
-    for k in range(len(instances)):
-        chart_result = ToChartResultConverterWithBlock.convert(
-            instances.pred_densepose[k], instances.pred_boxes[k], block_num=block_num
-        )
-        densepose_results_quantized = quantize_densepose_chart_result(chart_result)
-        densepose_results_quantized.labels_uv_uint8 = (
-            densepose_results_quantized.labels_uv_uint8.cpu()
-        )
-        segmentation = segmentations.tensor[k]
-        segmentation_encoded = mask_utils.encode(
-            np.require(segmentation.numpy(), dtype=np.uint8, requirements=["F"])
-        )
-        segmentation_encoded["counts"] = segmentation_encoded["counts"].decode("utf-8")
-        result = {
-            "densepose": densepose_results_quantized,
-            "segmentation": segmentation_encoded,
-        }
-        results.append(result)
-    return results
-
-
 def densepose_chart_predictions_to_storage_dict(instances):
     results = []
     for k in range(len(instances)):
@@ -459,7 +432,7 @@ def build_densepose_evaluator_storage(cfg: CfgNode, output_folder: str):
     return storage
 
 def inference_single_on_dataset(
-    model, data_loader, evaluator: Union[DatasetEvaluator, List[DatasetEvaluator], None], corrector=None
+    model, data_loader, evaluator: Union[DatasetEvaluator, List[DatasetEvaluator], None]
 ):
     num_devices = get_world_size()
     logger = logging.getLogger(__name__)
@@ -500,11 +473,6 @@ def inference_single_on_dataset(
                 person.pred_classes = person.gt_classes
 
             outputs = model.inference(inputs, detected_persons, do_postprocess=False)
-            if corrector is not None:
-                # outputs = model.inference(inputs, do_postprocess=False)
-                correction, _ = corrector(outputs)
-                corrector.correct(correction, outputs)
-                # outputs = GeneralizedRCNN._postprocess(outputs, inputs, model.preprocess_image(inputs))
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -640,7 +608,7 @@ class DensePoseCOCOSingleEvaluator(DatasetEvaluator):
 
         if self._output_dir:
             PathManager.mkdirs(self._output_dir)
-            file_path = os.path.join(self._output_dir, "coco_densepose_predictions.pth")
+            file_path = os.path.join(self._output_dir, "coco_single_densepose_predictions.pth")
             with PathManager.open(file_path, "wb") as f:
                 torch.save(predictions, f)
 
@@ -648,6 +616,12 @@ class DensePoseCOCOSingleEvaluator(DatasetEvaluator):
         res = OrderedDict()
 
         dists_results, i_compare, u_compare, v_compare = _evaluate_predictions_single_on_coco(predictions)
+
+        if self._output_dir:
+            PathManager.mkdirs(self._output_dir)
+            file_path = os.path.join(self._output_dir, "dists.pth")
+            with PathManager.open(file_path, "wb") as f:
+                torch.save(dists_results, f)
 
         return res
 
@@ -674,7 +648,24 @@ def prediction_single_to_dict(instances, img_id, class_to_mesh_name, use_storage
     raw_boxes_xywh = BoxMode.convert(
         instances.pred_boxes.tensor.clone(), BoxMode.XYXY_ABS, BoxMode.XYWH_ABS
     )
-
+    results = []
+    result_info = {
+        "image_id": img_id,
+        "category_id": classes,
+    }
+    for k in range(len(instances)):
+        densepose_results_quantized = quantize_densepose_chart_result(
+            ToChartResultConverter.convert(instances.pred_densepose[k], instances.pred_boxes[k])
+        )
+        densepose_results_quantized.labels_uv_uint8 = (
+            densepose_results_quantized.labels_uv_uint8.cpu()
+        )
+        result = {
+            "bbox": raw_boxes_xywh[k],
+            "densepose": densepose_results_quantized,
+            "gt_densepose": instances.gt_densepose.densepose_datas[k],
+        }
+        results.append({**result, **result_info})
     # gt_densepose = densepose_gt_to_dict(instances)
 
     # if isinstance(instances.pred_densepose, DensePoseEmbeddingPredictorOutput):
@@ -686,19 +677,6 @@ def prediction_single_to_dict(instances, img_id, class_to_mesh_name, use_storage
     #         results_densepose = densepose_chart_predictions_to_dict(instances) # list of dict
     #     else:
     #         results_densepose = densepose_chart_predictions_to_storage_dict(instances)
-    accumulator = Accumulator()
-    accumulator.accumulate(instances)
-    packed_annotations = accumulator.pack()
-    results_densepose = {
-        "packed_annotations": packed_annotations,
-        "pred_densepose": {
-            "u": instances.pred_densepose.u,
-            "v": instances.pred_densepose.v,
-            "fine_segm": instances.pred_densepose.fine_segm,
-        }
-    }
-
-    results = []
     # for k in range(len(instances)):
     #     result = {
     #         "image_id": img_id,
@@ -707,12 +685,6 @@ def prediction_single_to_dict(instances, img_id, class_to_mesh_name, use_storage
     #         "gt_densepose": gt_densepose[k],
     #     }
     #     results.append({**result, **results_densepose[k]})
-    result = {
-        "image_id": img_id,
-        "category_id": classes,
-        "bbox": raw_boxes_xywh,
-    }
-    results.append({**result, **results_densepose})
     return results
 
 
@@ -720,7 +692,6 @@ def _evaluate_predictions_single_on_coco(predictions):
     from scipy.io import loadmat
     import scipy.spatial.distance as ssd
     import pickle
-    from densepose.modeling.correction import InterpolationHelper
 
     smpl_subdiv_fpath = PathManager.get_local_path(
         "https://dl.fbaipublicfiles.com/densepose/data/SMPL_subdiv.mat"
@@ -757,18 +728,27 @@ def _evaluate_predictions_single_on_coco(predictions):
     n = 27554
     for prediction in predictions:
         # gt_densepose = prediction['gt_densepose']
-        packed_annotations = prediction['packed_annotations']
-        if packed_annotations is None:
+        gt_densepose = prediction['gt_densepose']
+        if gt_densepose is None:
             continue
         _, _, w_gt, h_gt = prediction['bbox']
+        # 255 or 256
+        # dp_x = (gt_densepose.x * w_gt / 255.0).int()
+        # dp_y = (gt_densepose.y * h_gt / 255.0).int()
+        # pos_index = (dp_x <= int(w_gt)) * (dp_y <= int(h_gt))
+        # dp_x = dp_x[pos_index]
+        # dp_y = dp_y[pos_index]
         dp_x = (gt_densepose.x * w_gt / 256.0).int()
         dp_y = (gt_densepose.y * h_gt / 256.0).int()
-        dp_x = dp_x[dp_x < w_gt]
+        # dp_x = dp_x[dp_x < w_gt]
 
         densepose_results_quantized = prediction["densepose"]
         i_est, u_est, v_est = _extract_iuv(
             densepose_results_quantized.labels_uv_uint8.numpy(), dp_y, dp_x
         )
+        i_gt = gt_densepose.i#[pos_index]
+        u_gt = gt_densepose.u#[pos_index]
+        v_gt = gt_densepose.v#[pos_index]
 
         # pred_densepose = prediction['pred_densepose']
         # packed_annotations = prediction['packed_annotations']

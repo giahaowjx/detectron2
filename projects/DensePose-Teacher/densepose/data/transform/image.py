@@ -38,6 +38,7 @@ class RandErase(Augmentation):
             patches=None,
             img_fill_val=125,
             random_magnitude=True,
+            mode='instance' # or 'image'
     ) -> None:
         super().__init__()
         self.n_iterations = n_iterations
@@ -46,20 +47,29 @@ class RandErase(Augmentation):
         self.patches = patches
         self.img_fill_val = img_fill_val
         self.random_magnitude = random_magnitude
+        self.mode = mode
 
-    def get_transform(self, image, instances, label=False):
+    def get_transform(self, image, instances=None, weak=False):
         h, w = image.shape[:2]
         # get magnitude
         patches = []
         if self.random_magnitude:
-            for i, bbox in enumerate(instances.gt_unlabeled_boxes):
-                x1, y1, x2, y2 = bbox.int()
-                if x1 != x2 and y1 != y2:
-                    n_iterations = self._get_erase_cycle()
-                    for _ in range(n_iterations):
-                        ph, pw = self._get_patch_size(y2 - y1, x2 - x1)
-                        px, py = torch.randint(x1, x2, (1,)).clamp(0, w - pw), torch.randint(y1, y2, (1,)).clamp(0, h - ph)
-                        patches.append([px, py, px + pw, py + ph])
+            if self.mode == 'image':
+                magnitude: dict = self.get_magnitude(h, w)
+                return EraseTransform(magnitude['patches'], self.img_fill_val)
+            elif self.mode == 'instance':
+                if weak:
+                    index = [x is not None for x in instances.gt_densepose.densepose_datas]
+                else:
+                    index = instances.gt_indices
+                for i, bbox in enumerate(instances.gt_unlabeled_boxes[index]):
+                    x1, y1, x2, y2 = bbox.int()
+                    if x1 != x2 and y1 != y2:
+                        n_iterations = self._get_erase_cycle()
+                        for _ in range(n_iterations):
+                            ph, pw = self._get_patch_size(y2 - y1, x2 - x1)
+                            px, py = torch.randint(x1, x2, (1,)).clamp(0, w - pw), torch.randint(y1, y2, (1,)).clamp(0, h - ph)
+                            patches.append([px, py, px + pw, py + ph])
         else:
             assert self.patches is not None
             patches = self.patches
@@ -74,24 +84,24 @@ class RandErase(Augmentation):
     #
     #     return inputs
 
-    # def get_magnitude(self, h, w):
-    #     magnitude = {}
-    #     if self.random_magnitude:
-    #         n_iterations = self._get_erase_cycle()
-    #         patches = []
-    #         for _ in range(n_iterations):
-    #             # random sample patch size in the image
-    #             ph, pw = self._get_patch_size(h, w)
-    #             # random sample patch left top in the image
-    #             # px, py = np.random.randint(0, w - pw), np.random.randint(0, h - ph)
-    #             px, py = torch.randint(0, w - pw, (1,)), torch.randint(0, h - ph, (1,))
-    #             patches.append([px, py, px + pw, py + ph])
-    #         magnitude["patches"] = patches
-    #     else:
-    #         assert self.patches is not None
-    #         magnitude["patches"] = self.patches
-    #
-    #     return magnitude
+    def get_magnitude(self, h, w):
+        magnitude = {}
+        if self.random_magnitude:
+            n_iterations = self._get_erase_cycle()
+            patches = []
+            for _ in range(n_iterations):
+                # random sample patch size in the image
+                ph, pw = self._get_patch_size(h, w)
+                # random sample patch left top in the image
+                # px, py = np.random.randint(0, w - pw), np.random.randint(0, h - ph)
+                px, py = torch.randint(0, w - pw, (1,)), torch.randint(0, h - ph, (1,))
+                patches.append([px, py, px + pw, py + ph])
+            magnitude["patches"] = patches
+        else:
+            assert self.patches is not None
+            magnitude["patches"] = self.patches
+
+        return magnitude
 
     def _get_erase_cycle(self):
         if isinstance(self.n_iterations, int):
@@ -132,6 +142,10 @@ class RandErase(Augmentation):
     #         # self._erase_mask(inputs, patch)
     #         # self._erase_seg(inputs, patch, fill_val=self.seg_ignore_label)
     #     return image
+
+
+
+
 
 class RandomRotation(Augmentation):
     """

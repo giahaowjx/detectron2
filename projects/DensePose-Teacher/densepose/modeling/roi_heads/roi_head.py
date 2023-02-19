@@ -144,7 +144,7 @@ class DensePoseROIHeads(StandardROIHeads):
                 densepose_loss_dict = self.densepose_losses(
                     proposals, densepose_predictor_outputs, iteration=iteration
                 )
-                return densepose_loss_dict, proposals
+                return densepose_loss_dict, proposals, densepose_predictor_outputs
         else:
             pred_boxes = [x.pred_boxes for x in instances]
 
@@ -173,11 +173,17 @@ class DensePoseROIHeads(StandardROIHeads):
         instances, losses = super().forward(images, features, proposals, targets)
         del targets, images
 
-        boxes = None
         if self.training:
-            loss, boxes = self._forward_densepose(features, instances, iteration=iteration)
+            loss, boxes, prediction = self._forward_densepose(features, instances, iteration=iteration)
             losses.update(loss)
-        return instances, losses, boxes
+            return instances, losses, boxes, prediction
+        return instances, losses
+
+    # def forward_strong(self, features: Dict[str, torch.Tensor], proposals: List[Instances], iteration=0):
+    #     if self.training:
+    #         loss, _ = self._forward_densepose(features, proposals, iteration=iteration)
+    #         return loss
+    #     return {}
 
     def forward_with_given_boxes(
         self, features: Dict[str, torch.Tensor], instances: List[Instances]
