@@ -232,13 +232,15 @@ class SimpleTrainer(TrainerBase):
     or write your own training loop.
     """
 
-    def __init__(self, model, data_loader, optimizer):
+    def __init__(self, model, data_loader, optimizer, gather_metric_period=1):
         """
         Args:
             model: a torch Module. Takes a data from data_loader and returns a
                 dict of losses.
             data_loader: an iterable. Contains data to be used to call model.
             optimizer: a torch optimizer.
+            gather_metric_period: an int. Every gather_metric_period iterations
+                the metrics are gathered from all the ranks to rank 0 and logged.
         """
         super().__init__()
 
@@ -255,6 +257,7 @@ class SimpleTrainer(TrainerBase):
         # to access the data loader iterator, call `self._data_loader_iter`
         self._data_loader_iter_obj = None
         self.optimizer = optimizer
+        self.gather_metric_period = gather_metric_period
 
     def run_step(self):
         """
@@ -317,7 +320,8 @@ class SimpleTrainer(TrainerBase):
         data_time: float,
         prefix: str = "",
     ) -> None:
-        SimpleTrainer.write_metrics(loss_dict, data_time, prefix)
+        if (self.iter + 1) % self.gather_metric_period == 0:
+            SimpleTrainer.write_metrics(loss_dict, data_time, prefix)
 
     @staticmethod
     def write_metrics(
@@ -378,24 +382,34 @@ class AMPTrainer(SimpleTrainer):
     in the training loop.
     """
 
-    def __init__(self, model, data_loader, optimizer, grad_scaler=None):
+    def __init__(
+        self,
+        model,
+        data_loader,
+        optimizer,
+        gather_metric_period=1,
+        grad_scaler=None,
+        precision: torch.dtype = torch.float16,
+    ):
         """
         Args:
-            model, data_loader, optimizer: same as in :class:`SimpleTrainer`.
+            model, data_loader, optimizer, gather_metric_period: same as in :class:`SimpleTrainer`.
             grad_scaler: torch GradScaler to automatically scale gradients.
+            precision: torch.dtype as the target precision to cast to in computations
         """
         unsupported = "AMPTrainer does not support single-process multi-device training!"
         if isinstance(model, DistributedDataParallel):
             assert not (model.device_ids and len(model.device_ids) > 1), unsupported
         assert not isinstance(model, DataParallel), unsupported
 
-        super().__init__(model, data_loader, optimizer)
+        super().__init__(model, data_loader, optimizer, gather_metric_period)
 
         if grad_scaler is None:
             from torch.cuda.amp import GradScaler
 
             grad_scaler = GradScaler()
         self.grad_scaler = grad_scaler
+        self.precision = precision
 
     def run_step(self):
         """
@@ -409,7 +423,7 @@ class AMPTrainer(SimpleTrainer):
         data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
-        with autocast():
+        with autocast(dtype=self.precision):
             loss_dict = self.model(data)
             if isinstance(loss_dict, torch.Tensor):
                 losses = loss_dict
