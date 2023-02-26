@@ -180,11 +180,11 @@ class GeneralizedRCNNDP(nn.Module):
             self.uv_symmetries[k] = self.uv_symmetries[k].to(self.device)
 
         # do_flip = choice([True, False, False])
-        # if torch.rand((1,)) < 0.25:
-        #     do_flip = True
-        # else:
-        #     do_flip = False
-        do_flip = False
+        if torch.rand((1,)) < 0.25:
+            do_flip = True
+        else:
+            do_flip = False
+        # do_flip = False
 
         images = self.preprocess_image(batched_inputs, do_flip=do_flip)
         if "instances" in batched_inputs[0]:
@@ -345,9 +345,9 @@ class GeneralizedRCNNDP(nn.Module):
     def get_unlabeled_loss(self, pseudo_labels, prediction, do_flip=False):
         n_channels = 25
         # factor = np.exp(-5 * (1 - self.iteration / self.total_iteration) ** 2) * 0.1
-        if (self.iteration + 1) <= 80000:
-            factor = np.exp(-5 * (1 - self.iteration / 80000) ** 2) * 0.1
-            threshold = np.exp(-5 * (1 - self.iteration / 80000) ** 2) * 0.15 + 0.8
+        if (self.iteration + 1) <= 160000:
+            factor = np.exp(-5 * (1 - self.iteration / 160000) ** 2) * 0.1
+            threshold = np.exp(-5 * (1 - self.iteration / 160000) ** 2) * 0.15 + 0.8
         # elif (self.iteration + 1) >= 200000:
         #     factor = 0.1
         # #     threshold = 0.85
@@ -448,8 +448,9 @@ class GeneralizedRCNNDP(nn.Module):
 
         if pos_index.sum() <= 0:
             losses.update({
-                "loss_unsup_u": prediction.u.sum() * 0,
-                "loss_unsup_v": prediction.v.sum() * 0,
+                # "loss_unsup_u": prediction.u.sum() * 0,
+                # "loss_unsup_v": prediction.v.sum() * 0,
+                "loss_unsup_uv": (prediction.u.sum() * 0) + (prediction.v.sum() * 0)
             })
         else:
             u_est = prediction.u.permute(0, 2, 3, 1).reshape(-1, n_channels)[pos_index]
@@ -524,21 +525,21 @@ class GeneralizedRCNNDP(nn.Module):
                     pseudo_u[indice] = self.uv_symmetries["U_transforms"][i - 1][v_loc, u_loc]
                     pseudo_v[indice] = self.uv_symmetries["V_transforms"][i - 1][v_loc, u_loc]
 
-                loss_u = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') * pseudo_sigma[good_indices]
-                loss_v = F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') * pseudo_sigma[good_indices]
-                # loss_uv = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') + \
-                #           F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') + 0.01
-                # loss_uv = torch.sqrt(loss_uv) * pseudo_sigma[good_indices]
+                # loss_u = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') * pseudo_sigma[good_indices]
+                # loss_v = F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') * pseudo_sigma[good_indices]
+                loss_uv = F.mse_loss(u_est[good_indices], pseudo_u[good_indices], reduction='none') + \
+                          F.mse_loss(v_est[good_indices], pseudo_v[good_indices], reduction='none') + 0.0001
+                loss_uv = torch.sqrt(loss_uv) * pseudo_sigma[good_indices]
             else:
-                loss_u = F.mse_loss(u_est, pseudo_u, reduction='none') * pseudo_sigma
-                loss_v = F.mse_loss(v_est, pseudo_v, reduction='none') * pseudo_sigma
-                # loss_uv = F.mse_loss(u_est, pseudo_u, reduction='none') + F.mse_loss(v_est, pseudo_v, reduction='none') + 0.01
-                # loss_uv = torch.sqrt(loss_uv) * pseudo_sigma
+                # loss_u = F.mse_loss(u_est, pseudo_u, reduction='none') * pseudo_sigma
+                # loss_v = F.mse_loss(v_est, pseudo_v, reduction='none') * pseudo_sigma
+                loss_uv = F.mse_loss(u_est, pseudo_u, reduction='none') + F.mse_loss(v_est, pseudo_v, reduction='none') + 0.01
+                loss_uv = torch.sqrt(loss_uv) * pseudo_sigma
 
             losses.update({
-                "loss_unsup_u": loss_u.sum() * 0.01 * factor,
-                "loss_unsup_v": loss_v.sum() * 0.01 * factor
-                # "loss_unsup_uv": loss_uv.sum() * 0.0005 * factor
+                # "loss_unsup_u": loss_u.sum() * 0.01 * factor,
+                # "loss_unsup_v": loss_v.sum() * 0.01 * factor
+                "loss_unsup_uv": loss_uv.sum() * 0.0005 * factor
             })
 
         return losses
@@ -547,9 +548,9 @@ class GeneralizedRCNNDP(nn.Module):
         return {
             "loss_unsup_coarse_segm": pseudo.coarse_segm.sum() * 0,
             "loss_unsup_fine_segm": pseudo.fine_segm.sum() * 0,
-            "loss_unsup_u": pseudo.u.sum() * 0,
-            "loss_unsup_v": pseudo.v.sum() * 0,
-            # "loss_unsup_uv": (pseudo.u.sum() * 0) + (pseudo.v.sum() * 0)
+            # "loss_unsup_u": pseudo.u.sum() * 0,
+            # "loss_unsup_v": pseudo.v.sum() * 0,
+            "loss_unsup_uv": (pseudo.u.sum() * 0) + (pseudo.v.sum() * 0)
         }
 
     def get_proposals_boxes(self, boxes, transforms, strong_shape, do_flip):

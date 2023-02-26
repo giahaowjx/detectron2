@@ -5,6 +5,8 @@ MODEL:
     DEPTH: 50
   ROI_DENSEPOSE_HEAD:
     NAME: "DensePoseDeepLabHead"
+    LOSS_NAME: "DensePoseChartLoss"
+    PREDICTOR_NAME: "DensePoseChartPredictor"
 SOLVER:
-  MAX_ITER: 130000
-  STEPS: (100000, 120000)
+  MAX_ITER: 260000
+  STEPS: (200000, 240000)

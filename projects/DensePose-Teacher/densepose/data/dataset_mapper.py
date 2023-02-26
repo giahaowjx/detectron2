@@ -42,7 +42,6 @@ def build_strong_augmentation(cfg, is_train):
         #         T.RandomSaturation(0.8, 1.2),
         #     ]
 
-        # if torch.rand((1,)) < 0.5:
         result.append(T.RandomRotation(
             cfg.INPUT.ST_ANGLES, expand=True, sample_style="range"
         ))
@@ -275,7 +274,7 @@ class DatasetMapper:
 
 def color_transform(image, intensity_min=0.0, intensity_max=1.0):
     p = np.random.uniform(0., 1.)
-    if p <= 0.15:
+    if p <= 0.25:
         op = choice([
             [ImageEnhance.Color],
             [
